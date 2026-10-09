@@ -1,0 +1,73 @@
+[project]
+name = "creative-benchmark-finder"
+version = "0.1.0"
+description = "AI Creative Benchmark Finder - discovers and runs creativity benchmarks against LLMs"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "httpx>=0.27.0",
+    "pydantic>=2.8.0",
+    "pydantic-settings>=2.3.0",
+    "typer>=0.12.0",
+    "tenacity>=8.4.0",
+    "python-dotenv>=1.0.0",
+    "openai>=1.35.0",
+    "anthropic>=0.39.0",
+    "google-genai>=1.0.0",
+    "numpy>=1.26.0",
+    "pandas>=2.2.0",
+    "scipy>=1.13.0",
+    "scikit-learn>=1.5.0",
+    "sentence-transformers>=3.0.0",
+    "sacrebleu>=2.4.0",
+    "krippendorff>=0.6.0",
+    "sqlmodel>=0.0.21",
+    "pyarrow>=16.0.0",
+    "arxiv>=2.1.0",
+    "semanticscholar>=0.6.0",
+    "huggingface_hub>=0.24.0",
+    "PyGithub>=2.4.0",
+    "feedparser>=6.0.0",
+    "beautifulsoup4>=4.12.0",
+    "jinja2>=3.1.0",
+    "matplotlib>=3.9.0",
+    "plotly>=5.22.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3.0",
+    "pytest-asyncio>=0.23.0",
+    "ruff>=0.6.0",
+    "mypy>=1.11.0",
+    "pre-commit>=3.8.0",
+]
+ui = [
+    "streamlit>=1.38.0",
+    "fastapi>=0.112.0",
+    "uvicorn>=0.30.0",
+]
+
+[build-system]
+requires = ["setuptools>=70.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+select = ["E", "F", "I", "UP", "B", "C4", "W"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_return_any = true
+warn_unused_ignores = true
+disallow_untyped_defs = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.typer]
+rich_markup_mode = "rich"

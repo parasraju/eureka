@@ -1,0 +1,97 @@
+# AI Creative Benchmark Finder Configuration
+
+models:
+  # Models to test - specify provider:model_id
+  # These will be validated against provider model lists at runtime
+  - "openai:gpt-4o"
+  - "openai:gpt-4o-mini"
+  - "anthropic:claude-3-5-sonnet-20241022"
+  - "anthropic:claude-3-5-haiku-20241022"
+  # - "google:gemini-1.5-pro"
+  # - "openrouter:anthropic/claude-3.5-sonnet"
+
+providers:
+  openai:
+    base_url: "https://api.openai.com/v1"
+    timeout: 60
+    max_retries: 3
+  anthropic:
+    base_url: "https://api.anthropic.com"
+    timeout: 60
+    max_retries: 3
+  google:
+    base_url: "https://generativelanguage.googleapis.com"
+    timeout: 60
+    max_retries: 3
+  openrouter:
+    base_url: "https://openrouter.ai/api/v1"
+    timeout: 60
+    max_retries: 3
+
+benchmarks:
+  tier_a:
+    - "dat"
+    - "aut"
+    - "diversity"
+  tier_b:
+    - "writing_elo"
+  tier_c:
+    - "associative"
+    - "affordance"
+
+# Experimental conditions to run
+conditions:
+  prompt_framing:
+    - "neutral"
+    - "be_creative"
+  temperature:
+    - 0.2
+    - 0.7
+    - 1.0
+  reasoning:
+    - false
+    - true
+  samples_per_cell: 30
+
+# Judge configuration (for tier_b benchmarks)
+judges:
+  - "openai:gpt-4o"
+  - "anthropic:claude-3-5-sonnet-20241022"
+  # - "google:gemini-1.5-pro"
+
+# Budget
+budget:
+  max_usd_per_run: 50.0
+  dry_run: false
+
+# Discovery
+discovery:
+  sources:
+    - "arxiv"
+    - "semantic_scholar"
+    - "huggingface"
+    - "github"
+  keywords:
+    - "creativity benchmark LLM"
+    - "divergent thinking language model"
+    - "creative writing evaluation"
+    - "novelty diversity generation"
+    - "associative creativity LLM"
+    - "creative problem solving benchmark"
+  since_days: 30
+  min_score: 0.5
+
+# Embeddings
+embeddings:
+  provider: "sentence_transformers"  # or "openai"
+  model: "sentence-transformers/all-MiniLM-L6-v2"
+  dat_vectors: "glove"  # glove or provider
+
+# Output
+output:
+  runs_dir: "runs"
+  reports_dir: "reports"
+  formats:
+    - "markdown"
+    - "html"
+    - "json"
