@@ -1,11 +1,13 @@
-import pytest
 import sys
+
+import pytest
+
 sys.path.insert(0, r'D:\p\eureka\src')
 
-from cbf.benchmarks.dat import DATBenchmark, DATConfig
-from cbf.benchmarks.aut import AUTBenchmark, AUTConfig
-from cbf.benchmarks.diversity import DiversityBenchmark, DiversityConfig
 from cbf.benchmarks import get_benchmark, list_benchmarks
+from cbf.benchmarks.aut import AUTBenchmark
+from cbf.benchmarks.dat import DATBenchmark
+from cbf.benchmarks.diversity import DiversityBenchmark
 
 
 def test_dat_prompts():

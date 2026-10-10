@@ -1,10 +1,10 @@
 from .panel import (
     JudgeConfig,
-    PairwiseResult,
     JudgePanel,
+    PairwiseResult,
     WritingEloBenchmark,
-    compute_elo,
     compute_bradley_terry,
+    compute_elo,
     compute_inter_judge_agreement,
     run_writing_elo_with_judges,
 )

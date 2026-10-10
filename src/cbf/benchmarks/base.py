@@ -1,6 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Protocol, Any
-from abc import abstractmethod
+from typing import Protocol
 
 
 @dataclass

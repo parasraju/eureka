@@ -1,11 +1,17 @@
 import asyncio
 from dataclasses import dataclass, field
-from typing import Any
-import numpy as np
-from sklearn.metrics.pairwise import cosine_distances
-from sacrebleu.metrics import BLEU
 
-from .base import Benchmark, BenchmarkItem, RawResults, Scores
+import numpy as np
+
+from cbf.metrics import (
+    cluster_by_similarity,
+    distinct_n,
+    mean_ci,
+    mean_pairwise_distance,
+    self_bleu,
+)
+
+from .base import BenchmarkItem, RawResults, Scores
 
 
 @dataclass
@@ -107,48 +113,13 @@ class DiversityBenchmark:
         return model.encode(texts, convert_to_numpy=True, normalize_embeddings=True)
 
     def _compute_distinct_n(self, texts: list[str], n: int) -> float:
-        all_ngrams = []
-        unique_ngrams = set()
-        for text in texts:
-            words = text.lower().split()
-            for i in range(len(words) - n + 1):
-                ngram = tuple(words[i:i+n])
-                all_ngrams.append(ngram)
-                unique_ngrams.add(ngram)
-        return len(unique_ngrams) / len(all_ngrams) if all_ngrams else 0.0
+        return distinct_n(texts, n)
 
     def _compute_self_bleu(self, texts: list[str]) -> float:
-        if len(texts) < 2:
-            return 0.0
-        bleu = BLEU()
-        scores = []
-        for i, text in enumerate(texts):
-            refs = [t for j, t in enumerate(texts) if j != i]
-            score = bleu.sentence_score(text, refs).score / 100.0
-            scores.append(score)
-        return float(np.mean(scores))
+        return self_bleu(texts)
 
     def _cluster_by_similarity(self, embeddings: np.ndarray, threshold: float) -> list[list[int]]:
-        n = len(embeddings)
-        if n == 0:
-            return []
-        visited = [False] * n
-        clusters = []
-
-        for i in range(n):
-            if visited[i]:
-                continue
-            cluster = [i]
-            visited[i] = True
-            for j in range(i + 1, n):
-                if not visited[j]:
-                    sim = np.dot(embeddings[i], embeddings[j])
-                    if sim >= threshold:
-                        cluster.append(j)
-                        visited[j] = True
-            clusters.append(cluster)
-
-        return clusters
+        return cluster_by_similarity(embeddings, threshold)
 
     def score(self, raw: RawResults) -> Scores:
         by_prompt: dict[int, list[dict]] = {}
@@ -174,16 +145,14 @@ class DiversityBenchmark:
         all_self_bleu = []
         all_num_clusters = []
 
-        for prompt_idx, items in by_prompt.items():
+        for _prompt_idx, items in by_prompt.items():
             texts = [item["text"] for item in items if item.get("text")]
             if len(texts) < 2:
                 continue
 
             embeddings = self._get_embeddings(texts)
 
-            distances = cosine_distances(embeddings)
-            np.fill_diagonal(distances, np.nan)
-            mean_dist = float(np.nanmean(distances))
+            mean_dist = mean_pairwise_distance(embeddings)
             all_diversity.append(mean_dist)
 
             clusters = self._cluster_by_similarity(embeddings, self.config.similarity_threshold)
@@ -201,15 +170,8 @@ class DiversityBenchmark:
             quality = num_clusters * mean_dist
             all_quality.append(quality)
 
-        from scipy import stats
-
         def ci(data):
-            if len(data) < 2:
-                return (float(np.mean(data)) if data else 0.0, float(np.mean(data)) if data else 0.0)
-            mean = float(np.mean(data))
-            sem = stats.sem(data)
-            low, high = stats.t.interval(0.95, len(data) - 1, loc=mean, scale=sem)
-            return (float(low), float(high))
+            return mean_ci(data)
 
         diversity_mean = float(np.mean(all_diversity)) if all_diversity else 0.0
         quality_mean = float(np.mean(all_quality)) if all_quality else 0.0
@@ -232,7 +194,7 @@ class DiversityBenchmark:
             confidence_intervals={
                 "diversity_score": ci(all_diversity),
                 "quality_score": ci(all_quality),
-                "composite": ci([d * q for d, q in zip(all_diversity, all_quality)]) if all_diversity and all_quality else (0.0, 0.0),
+                "composite": ci([d * q for d, q in zip(all_diversity, all_quality, strict=False)]) if all_diversity and all_quality else (0.0, 0.0),
             },
             metadata={
                 "per_prompt": {

@@ -1,9 +1,9 @@
 import asyncio
-from dataclasses import dataclass, field
-from typing import Any
-from datetime import datetime
-from github import Github
 import os
+from dataclasses import dataclass, field
+from datetime import datetime
+
+from github import Github
 
 
 @dataclass

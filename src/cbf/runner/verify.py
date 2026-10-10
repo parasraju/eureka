@@ -1,9 +1,7 @@
-import json
 from pathlib import Path
-from dataclasses import asdict
 
-from cbf.storage import load_manifest, load_calls, CallLogEntry, RunManifest
 from cbf.benchmarks import get_benchmark
+from cbf.storage import load_calls, load_manifest
 
 
 def verify_run(run_id: str, runs_dir: str = "runs") -> dict:
@@ -42,8 +40,6 @@ def verify_run(run_id: str, runs_dir: str = "runs") -> dict:
         "call_ids": [c.call_id for c in calls],
         "metadata": {},
     }
-
-    call_by_id = {c.call_id: c for c in calls}
 
     for call in calls:
         if call.error:

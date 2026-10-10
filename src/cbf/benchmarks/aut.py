@@ -1,12 +1,11 @@
-import re
 import asyncio
+import re
 from dataclasses import dataclass, field
-from typing import Any
-from pathlib import Path
+
 import numpy as np
 from sklearn.metrics.pairwise import cosine_distances
 
-from .base import Benchmark, BenchmarkItem, RawResults, Scores
+from .base import BenchmarkItem, RawResults, Scores
 from .dat import DATBenchmark, DATConfig
 
 
@@ -193,15 +192,10 @@ Only list the uses, one per line."""
                     originality = 0.0
                 all_originality.append(originality)
 
-        from scipy import stats
+        from cbf.metrics import mean_ci
 
         def ci(data):
-            if len(data) < 2:
-                return (float(np.mean(data)) if data else 0.0, float(np.mean(data)) if data else 0.0)
-            mean = float(np.mean(data))
-            sem = stats.sem(data)
-            low, high = stats.t.interval(0.95, len(data) - 1, loc=mean, scale=sem)
-            return (float(low), float(high))
+            return mean_ci(data)
 
         return Scores(
             benchmark_id=self.id,

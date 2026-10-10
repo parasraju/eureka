@@ -1,14 +1,12 @@
 import asyncio
-import random
 from dataclasses import dataclass, field
-from typing import Any
-from pathlib import Path
+
+import krippendorff
 import numpy as np
 from scipy import stats
-import krippendorff
 
+from cbf.benchmarks import BenchmarkItem, RawResults, Scores
 from cbf.providers import LLMProvider, LLMRequest
-from cbf.benchmarks import Benchmark, BenchmarkItem, RawResults, Scores
 
 
 @dataclass
@@ -164,7 +162,7 @@ def compute_elo(
         items.add(r.item_a_id)
         items.add(r.item_b_id)
 
-    ratings = {item: initial_rating for item in items}
+    ratings = dict.fromkeys(items, initial_rating)
 
     for result in results:
         if result.winner == "tie":
@@ -231,7 +229,7 @@ def compute_bradley_terry(
 
 
 def compute_inter_judge_agreement(results: list[PairwiseResult]) -> dict:
-    judges = list(set(r.judge for r in results))
+    judges = list({r.judge for r in results})
     items = set()
     for r in results:
         items.add(r.item_a_id)
@@ -377,11 +375,6 @@ async def run_writing_elo_with_judges(
     temperature: float = 0.8,
     rubric: str = "",
 ) -> dict:
-    bench = WritingEloBenchmark({
-        "prompts": prompts,
-        "rubric": rubric,
-    })
-
     judge_config = JudgeConfig(
         judge_models=judge_models,
         rubric=rubric,

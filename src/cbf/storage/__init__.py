@@ -1,12 +1,9 @@
 import json
-import os
-import time
-import uuid
-from dataclasses import dataclass, field, asdict
-from typing import Any
-from datetime import datetime, timezone
-from pathlib import Path
 import threading
+import uuid
+from dataclasses import asdict, dataclass, field
+from datetime import UTC, datetime
+from pathlib import Path
 
 
 @dataclass
@@ -74,7 +71,7 @@ class CallLogger:
         self._lock = threading.Lock()
         self._manifest = RunManifest(
             run_id=run_id,
-            started_utc=datetime.now(timezone.utc).isoformat(),
+            started_utc=datetime.now(UTC).isoformat(),
         )
 
     def log_call(
@@ -91,7 +88,7 @@ class CallLogger:
         entry = CallLogEntry(
             run_id=self.run_id,
             call_id=call_id,
-            timestamp_utc=datetime.now(timezone.utc).isoformat(),
+            timestamp_utc=datetime.now(UTC).isoformat(),
             provider=provider,
             model=model,
             request=request,
@@ -118,7 +115,7 @@ class CallLogger:
 
     def finalize(self, status: str = "completed", error: str | None = None):
         with self._lock:
-            self._manifest.ended_utc = datetime.now(timezone.utc).isoformat()
+            self._manifest.ended_utc = datetime.now(UTC).isoformat()
             self._manifest.status = status
             self._manifest.error = error
             with open(self.manifest_file, "w", encoding="utf-8") as f:
@@ -126,6 +123,18 @@ class CallLogger:
 
     def get_manifest(self) -> RunManifest:
         return self._manifest
+
+    def load_calls(self) -> list[CallLogEntry]:
+        if not self.calls_file.exists():
+            return []
+        entries: list[CallLogEntry] = []
+        with self._lock:
+            with open(self.calls_file, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        entries.append(CallLogEntry(**json.loads(line)))
+        return entries
 
 
 def load_manifest(run_id: str, runs_dir: str = "runs") -> RunManifest | None:

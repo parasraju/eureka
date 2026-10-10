@@ -1,11 +1,12 @@
 import sys
+
 sys.path.insert(0, r'D:\p\eureka\src')
 
 from cbf.judging.panel import (
-    compute_elo,
-    compute_bradley_terry,
-    compute_inter_judge_agreement,
     PairwiseResult,
+    compute_bradley_terry,
+    compute_elo,
+    compute_inter_judge_agreement,
 )
 
 

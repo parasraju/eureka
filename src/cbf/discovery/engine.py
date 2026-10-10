@@ -1,15 +1,14 @@
 import asyncio
-import json
-from dataclasses import dataclass, field, asdict
-from typing import Any
-from datetime import datetime, timedelta
-from pathlib import Path
 import hashlib
+import json
+from dataclasses import asdict, dataclass, field
+from datetime import datetime
+from pathlib import Path
 
-from .sources.arxiv import ArxivSource, ArxivConfig
-from .sources.semantic_scholar import SemanticScholarSource, SemanticScholarConfig
-from .sources.huggingface import HuggingFaceSource, HuggingFaceConfig
-from .sources.github import GitHubSource, GitHubConfig
+from .sources.arxiv import ArxivConfig, ArxivSource
+from .sources.github import GitHubConfig, GitHubSource
+from .sources.huggingface import HuggingFaceConfig, HuggingFaceSource
+from .sources.semantic_scholar import SemanticScholarConfig, SemanticScholarSource
 
 
 @dataclass

@@ -1,7 +1,7 @@
-from dataclasses import dataclass, field
-from typing import Protocol
-from datetime import datetime, timezone
 import uuid
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from typing import Protocol
 
 
 @dataclass
@@ -24,7 +24,7 @@ class LLMResponse:
     output_tokens: int
     latency_s: float
     raw: dict
-    timestamp_utc: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    timestamp_utc: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
 
 
 class LLMProvider(Protocol):

@@ -1,15 +1,13 @@
-import asyncio
-import uuid
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import Any
 import hashlib
+import uuid
+from datetime import UTC, datetime
+from pathlib import Path
+
 import yaml
 
-from cbf.providers import build_registry_from_settings, parse_model_spec, ProviderRegistry
-from cbf.benchmarks import get_benchmark, TIER_A, list_benchmarks
-from cbf.storage import CallLogger, BudgetGuard, RunManifest
-from cbf.providers.base import LLMRequest
+from cbf.benchmarks import TIER_A, get_benchmark, list_benchmarks
+from cbf.providers import ProviderRegistry, build_registry_from_settings, parse_model_spec
+from cbf.storage import BudgetGuard, CallLogger
 
 
 class BenchmarkRunner:
@@ -30,7 +28,7 @@ class BenchmarkRunner:
             raise ValueError(f"Provider {provider_name} not configured")
 
         budget_limit = max_usd or self.config.get("budget", {}).get("max_usd_per_run", 50.0)
-        self.run_id = f"{model_spec.replace(':', '-')}-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
+        self.run_id = f"{model_spec.replace(':', '-')}-{datetime.now(UTC).strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
         self.logger = CallLogger(self.run_id, runs_dir=str(self.runs_dir))
         self.budget = BudgetGuard(budget_limit)
 
@@ -112,7 +110,7 @@ async def run_benchmarks(
     runner = BenchmarkRunner(config, runs_dir)
 
     if dry_run:
-        run_id = f"{model_spec.replace(':', '-')}-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
+        run_id = f"{model_spec.replace(':', '-')}-{datetime.now(UTC).strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
         runner.run_id = run_id
         runner.logger = CallLogger(run_id, runs_dir=str(runs_dir))
         runner.logger.update_manifest(

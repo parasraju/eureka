@@ -1,7 +1,7 @@
-from .arxiv import ArxivSource, ArxivConfig
-from .semantic_scholar import SemanticScholarSource, SemanticScholarConfig
-from .huggingface import HuggingFaceSource, HuggingFaceConfig
-from .github import GitHubSource, GitHubConfig
+from .arxiv import ArxivConfig, ArxivSource
+from .github import GitHubConfig, GitHubSource
+from .huggingface import HuggingFaceConfig, HuggingFaceSource
+from .semantic_scholar import SemanticScholarConfig, SemanticScholarSource
 
 __all__ = [
     "ArxivSource",

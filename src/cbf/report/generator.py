@@ -1,14 +1,12 @@
 import json
-import yaml
-from pathlib import Path
-from typing import Any
-from dataclasses import asdict
 from datetime import datetime
-from jinja2 import Environment, FileSystemLoader, select_autoescape
+from typing import Any
 
-from cbf.storage import load_manifest, load_calls, RunManifest, CallLogEntry
-from cbf.benchmarks import get_benchmark, list_benchmarks
+from jinja2 import Environment, select_autoescape
+
+from cbf.benchmarks import get_benchmark
 from cbf.benchmarks.base import RawResults
+from cbf.storage import load_calls, load_manifest
 
 
 def load_run_results(run_id: str, runs_dir: str = "runs") -> dict[str, Any]:
@@ -117,8 +115,8 @@ def generate_markdown_report(run_id: str, runs_dir: str = "runs") -> str:
     manifest = run_data["manifest"]
 
     lines = [
-        f"# Creativity Benchmark Report",
-        f"",
+        "# Creativity Benchmark Report",
+        "",
         f"**Run ID:** {manifest.run_id}",
         f"**Model:** {scores['model']}",
         f"**Benchmark:** {scores['benchmark']}",
@@ -127,9 +125,9 @@ def generate_markdown_report(run_id: str, runs_dir: str = "runs") -> str:
         f"**Ended:** {manifest.ended_utc or 'N/A'}",
         f"**Total Cost:** ${manifest.total_cost_usd:.4f}",
         f"**Total API Calls:** {manifest.total_calls}",
-        f"",
-        f"## Scores",
-        f"",
+        "",
+        "## Scores",
+        "",
     ]
 
     for metric, value in scores["metrics"].items():
@@ -156,8 +154,6 @@ def generate_markdown_report(run_id: str, runs_dir: str = "runs") -> str:
 
 
 def generate_html_report(run_id: str, runs_dir: str = "runs") -> str:
-    md_content = generate_markdown_report(run_id, runs_dir)
-
     html_template = """
 <!DOCTYPE html>
 <html>
@@ -185,7 +181,7 @@ def generate_html_report(run_id: str, runs_dir: str = "runs") -> str:
     <p><strong>Status:</strong> <span class="badge {% if status == 'completed' %}badge-success{% elif status == 'running' %}badge-warning{% else %}badge-error{% endif %}">{{ status }}</span></p>
     <p><strong>Total Cost:</strong> ${{ "%.4f"|format(total_cost) }}</p>
     <p><strong>Total API Calls:</strong> {{ total_calls }}</p>
-    
+
     <h2>Scores</h2>
     <table>
         <tr><th>Metric</th><th>Value</th><th>95% CI</th></tr>
@@ -203,7 +199,7 @@ def generate_html_report(run_id: str, runs_dir: str = "runs") -> str:
         </tr>
         {% endfor %}
     </table>
-    
+
     <div class="footer">
         Report generated at {{ generated_at }}Z
     </div>
@@ -280,10 +276,10 @@ def save_report(run_id: str, output_path: str, format: str = "markdown", runs_di
 
 def generate_leaderboard_markdown(leaderboard: dict[str, dict]) -> str:
     lines = [
-        f"# Creativity Benchmark Leaderboard",
-        f"",
+        "# Creativity Benchmark Leaderboard",
+        "",
         f"*Generated at {datetime.utcnow().isoformat()}Z*",
-        f"",
+        "",
     ]
 
     all_benchmarks = set()

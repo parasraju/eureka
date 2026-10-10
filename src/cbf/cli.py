@@ -1,23 +1,20 @@
 import asyncio
 import json
-import os
-import sys
 from pathlib import Path
-from typing import Optional
+
 import typer
+import yaml
+from rich import print as rprint
 from rich.console import Console
 from rich.table import Table
-from rich.panel import Panel
-from rich import print as rprint
 
 from cbf.providers import build_registry_from_settings, parse_model_spec
-from cbf.storage import CallLogger, BudgetGuard, RunManifest, load_manifest, load_calls
-from cbf.benchmarks import get_benchmark, TIER_A, list_benchmarks
 from cbf.runner import run_benchmarks
 from cbf.runner.verify import verify_run
-import yaml
 
 app = typer.Typer(name="cbf", help="AI Creative Benchmark Finder")
+reg_app = typer.Typer(help="Manage the discovered-benchmark registry (SQLite).")
+app.add_typer(reg_app, name="registry")
 console = Console()
 
 
@@ -31,8 +28,8 @@ def load_config() -> dict:
 
 @app.command()
 def ping(
-    provider: Optional[str] = typer.Option(None, "--provider", "-p", help="Specific provider to ping (openai, anthropic, google, openrouter)"),
-    model: Optional[str] = typer.Option(None, "--model", "-m", help="Model to test (provider:model)"),
+    provider: str | None = typer.Option(None, "--provider", "-p", help="Specific provider to ping (openai, anthropic, google, openrouter)"),
+    model: str | None = typer.Option(None, "--model", "-m", help="Model to test (provider:model)"),
 ):
     """Test connectivity to configured providers with a real API call."""
     config = load_config()
@@ -115,12 +112,21 @@ def discover(
     min_score: float = typer.Option(0.3, "--min-score", help="Minimum relevance score"),
     output: str = typer.Option("table", "--output", "-o", help="Output format: table, json"),
     source: str = typer.Option(None, "--source", help="Specific source to search (arxiv, semantic_scholar, huggingface, github)"),
+    digest: bool = typer.Option(False, "--digest", help="Print the weekly 'what's new' digest from the registry"),
+    digest_days: int = typer.Option(7, "--digest-days", help="Days to look back for the digest"),
 ):
     """Discover creativity benchmarks from live sources."""
     config = load_config()
     disc_config = config.get("discovery", {})
 
-    from cbf.discovery import DiscoveryEngine, DiscoveryConfig, ArxivConfig, SemanticScholarConfig, HuggingFaceConfig, GitHubConfig
+    from cbf.discovery import (
+        ArxivConfig,
+        DiscoveryConfig,
+        DiscoveryEngine,
+        GitHubConfig,
+        HuggingFaceConfig,
+        SemanticScholarConfig,
+    )
 
     engine_config = DiscoveryConfig(
         sources=[source] if source else disc_config.get("sources", ["arxiv", "semantic_scholar", "huggingface", "github"]),
@@ -181,6 +187,16 @@ def discover(
 
         if len(benchmarks) > 20:
             rprint(f"[dim]... and {len(benchmarks) - 20} more[/dim]")
+
+    from dataclasses import asdict
+
+    from cbf.discovery import RegistryDB
+
+    with RegistryDB() as db:
+        db.upsert([asdict(b) for b in benchmarks])
+        rprint(f"[green]Saved {len(benchmarks)} candidates to registry[/green]")
+        if digest:
+            print(db.digest(days=digest_days))
 
 
 @app.command()
@@ -249,7 +265,7 @@ def run(
         rprint(f"[red]Run failed: {e}[/red]")
         import traceback
         traceback.print_exc()
-        raise typer.Exit(1)
+        raise typer.Exit(1) from e
 
 
 @app.command()
@@ -266,7 +282,7 @@ def verify(
         rprint(f"[red]Verification failed: {result.get('error', 'Unknown error')}[/red]")
         raise typer.Exit(1)
 
-    rprint(f"[green]Verification successful![/green]")
+    rprint("[green]Verification successful![/green]")
     rprint(f"Run ID: {result['run_id']}")
     rprint(f"Benchmark: {result['benchmark']}")
     rprint(f"Model: {result['model']}")
@@ -290,7 +306,11 @@ def report(
     output: str = typer.Option(None, "--output", "-o", help="Output file path"),
 ):
     """Generate a report for a completed run."""
-    from cbf.report import generate_markdown_report, generate_html_report, generate_json_report, save_report
+    from cbf.report import (
+        generate_html_report,
+        generate_json_report,
+        generate_markdown_report,
+    )
 
     if format == "markdown":
         content = generate_markdown_report(run_id, runs_dir)
@@ -319,6 +339,145 @@ def report(
     else:
         rprint(f"[red]Unknown format: {format}[/red]")
         raise typer.Exit(1)
+
+
+@reg_app.command("list")
+def registry_list(
+    status: str | None = typer.Option(None, "--status", help="Filter by status (seed, candidate, adapter_drafted, approved, rejected)"),
+    min_score: float = typer.Option(0.0, "--min-score", help="Minimum composite score"),
+    db_path: str = typer.Option("data/registry.db", "--db", help="Registry database path"),
+):
+    """List discovered benchmarks from the registry."""
+    from cbf.discovery import RegistryDB
+
+    with RegistryDB(db_path) as db:
+        entries = db.search(status=status, min_score=min_score)
+        table = Table(title=f"Registry — {status or 'all'} ({len(entries)} entries)")
+        table.add_column("Score", style="green")
+        table.add_column("Status", style="cyan")
+        table.add_column("Title")
+        table.add_column("Source")
+        for e in entries[:60]:
+            table.add_row(f"{e.score:.2f}", e.status, e.title[:70], e.source)
+        console.print(table)
+        if len(entries) > 60:
+            rprint(f"[dim]... and {len(entries) - 60} more[/dim]")
+
+
+@reg_app.command("approve")
+def registry_approve(
+    entry_id: str = typer.Argument(..., help="Registry id of the benchmark to approve"),
+    reason: str = typer.Option("human approval", "--reason", help="Approval note"),
+    db_path: str = typer.Option("data/registry.db", "--db", help="Registry database path"),
+):
+    """Approve a benchmark so its adapter may run on a published leaderboard."""
+    from cbf.discovery import RegistryDB
+
+    with RegistryDB(db_path) as db:
+        db.set_status(entry_id, "approved", reason=reason)
+    rprint(f"[green]Approved {entry_id}[/green]")
+
+
+@reg_app.command("status")
+def registry_status(
+    entry_id: str = typer.Argument(..., help="Registry id"),
+    status: str = typer.Argument(..., help="seed | candidate | adapter_drafted | approved | rejected"),
+    reason: str = typer.Option("", "--reason", help="Optional note"),
+    db_path: str = typer.Option("data/registry.db", "--db", help="Registry database path"),
+):
+    """Set a benchmark's status manually."""
+    from cbf.discovery import RegistryDB
+
+    with RegistryDB(db_path) as db:
+        db.set_status(entry_id, status, reason=reason)
+    rprint(f"[green]{entry_id} -> {status}[/green]")
+
+
+@reg_app.command("digest")
+def registry_digest(
+    days: int = typer.Option(7, "--days", help="Look-back window in days"),
+    db_path: str = typer.Option("data/registry.db", "--db", help="Registry database path"),
+):
+    """Print the 'what's new' discovery digest."""
+    from cbf.discovery import RegistryDB
+
+    with RegistryDB(db_path) as db:
+        print(db.digest(days=days))
+
+
+@app.command()
+def leaderboard(
+    output: str = typer.Option(None, "--output", "-o", help="Write markdown leaderboard to a file"),
+    runs_dir: str = typer.Option("runs", "--runs-dir", help="Runs directory"),
+):
+    """Generate a leaderboard across all runs, best run per model and benchmark."""
+    from pathlib import Path
+
+    from cbf.report import generate_leaderboard, generate_leaderboard_markdown
+
+    run_ids = [d.name for d in Path(runs_dir).iterdir() if d.is_dir() and (d / "manifest.json").exists()]
+    if not run_ids:
+        rprint("[yellow]No runs found.[/yellow]")
+        return
+
+    board = generate_leaderboard(run_ids, runs_dir)
+    content = generate_leaderboard_markdown(board)
+    if output:
+        with open(output, "w", encoding="utf-8") as f:
+            f.write(content)
+        rprint(f"[green]Leaderboard saved to {output}[/green]")
+    else:
+        print(content)
+
+
+@app.command()
+def compare(
+    runs: str = typer.Argument(..., help="Comma-separated run IDs"),
+    output: str = typer.Option(None, "--output", "-o", help="Write markdown to a file"),
+    runs_dir: str = typer.Option("runs", "--runs-dir", help="Runs directory"),
+):
+    """Compare multiple runs side by side (CI + cost)."""
+    from cbf.report import compare_runs, render_comparison_markdown
+
+    run_ids = [r.strip() for r in runs.split(",") if r.strip()]
+    content = render_comparison_markdown(compare_runs(run_ids, runs_dir))
+    if output:
+        with open(output, "w", encoding="utf-8") as f:
+            f.write(content)
+        rprint(f"[green]Comparison saved to {output}[/green]")
+    else:
+        print(content)
+
+
+@app.command()
+def radar(
+    runs: str = typer.Argument(..., help="Comma-separated run IDs to overlay on one chart"),
+    output: str = typer.Option("report/radar.png", "--output", "-o", help="PNG output path"),
+    title: str = typer.Option("Creativity Profile", "--title", help="Chart title"),
+    runs_dir: str = typer.Option("runs", "--runs-dir", help="Runs directory"),
+):
+    """Render a radar chart of normalized creativity dimensions for one or more runs."""
+    from cbf.report import creativity_profile, radar_chart
+
+    run_ids = [r.strip() for r in runs.split(",") if r.strip()]
+    profiles = [creativity_profile(run_id, runs_dir) for run_id in run_ids]
+    models = {}
+    for p in profiles:
+        if "error" in p:
+            rprint(f"[red]{p['error']}[/red]")
+            continue
+        models[p["model"]] = p["dimensions"]
+
+    if not models:
+        rprint("[red]No comparable profiles.[/red]")
+        raise typer.Exit(1)
+
+    if len({frozenset(m.keys()) for m in models.values()}) != 1:
+        rprint("[red]Runs cover different benchmark dimensions; cannot overlay on one radar.[/red]")
+        raise typer.Exit(1)
+
+    path = radar_chart(models, output, title=title)
+    rprint(f"[green]Radar chart saved to {path}[/green]")
 
 
 if __name__ == "__main__":

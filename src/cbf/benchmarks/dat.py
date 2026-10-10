@@ -1,13 +1,12 @@
-import re
-import json
 import asyncio
-from dataclasses import dataclass, field
-from typing import Any
+import re
+from dataclasses import dataclass
 from pathlib import Path
+
 import numpy as np
 from sklearn.metrics.pairwise import cosine_distances
 
-from .base import Benchmark, BenchmarkItem, RawResults, Scores
+from .base import BenchmarkItem, RawResults, Scores
 
 
 @dataclass
@@ -25,7 +24,7 @@ class DATBenchmark:
     id = "dat"
     version = "1.0.0"
 
-    DAT_PROMPT_NEUTRAL = """Please list {num_words} words that are as different from each other as possible, in terms of their meanings. 
+    DAT_PROMPT_NEUTRAL = """Please list {num_words} words that are as different from each other as possible, in terms of their meanings.
 The words should be common English nouns (single words only, no phrases).
 Format your response as a simple comma-separated list.
 
@@ -199,8 +198,9 @@ Example format: word1, word2, word3, word4, word5, word6, word7, word8, word9, w
         std_score = float(np.std(all_scores, ddof=1)) if len(all_scores) > 1 else 0.0
         n = len(all_scores)
 
-        from scipy import stats
-        ci_low, ci_high = stats.t.interval(0.95, n - 1, loc=mean_score, scale=stats.sem(all_scores))
+        from cbf.metrics import mean_ci
+
+        ci_low, ci_high = mean_ci(all_scores.tolist())
 
         return Scores(
             benchmark_id=self.id,
