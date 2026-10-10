@@ -1,6 +1,8 @@
 import hashlib
 import uuid
+from dataclasses import asdict
 from datetime import UTC, datetime
+from itertools import product
 from pathlib import Path
 
 import yaml
@@ -8,6 +10,69 @@ import yaml
 from cbf.benchmarks import TIER_A, get_benchmark, list_benchmarks
 from cbf.providers import ProviderRegistry, build_registry_from_settings, parse_model_spec
 from cbf.storage import BudgetGuard, CallLogger
+
+
+def expand_conditions(conditions: dict) -> dict:
+    """Normalize a conditions spec into a mapping of cell name -> run config.
+
+    Accepts either an explicit ``{name: config}`` mapping (returned unchanged) or a
+    factorial grid ``{factor: [levels...], "samples_per_cell": N}`` expanded into cells.
+    """
+    if not conditions:
+        return conditions
+    if all(isinstance(v, dict) for v in conditions.values()):
+        return conditions
+
+    list_factors = {k: v for k, v in conditions.items() if isinstance(v, list)}
+    if not list_factors:
+        return conditions
+
+    scalars = {k: v for k, v in conditions.items() if not isinstance(v, list)}
+    if "samples_per_cell" in scalars:
+        scalars["num_samples"] = scalars.pop("samples_per_cell")
+
+    cells: dict[str, dict] = {}
+    keys = list(list_factors.keys())
+    for combo in product(*(list_factors[k] for k in keys)):
+        factor = dict(zip(keys, combo, strict=False))
+        framing = str(factor.get("prompt_framing", "neutral")).lower()
+        cell_cfg = {"condition": "creative" if "creat" in framing else "neutral", **scalars, **factor}
+        name = ",".join(f"{k}={factor[k]}" for k in keys)
+        cells[name] = cell_cfg
+    return cells
+
+
+class _LoggingProvider:
+    """Wraps a provider so every completion is persisted to the run call log."""
+
+    def __init__(self, provider, logger: CallLogger, budget: BudgetGuard | None):
+        self._provider = provider
+        self._logger = logger
+        self._budget = budget
+        self.name = getattr(provider, "name", "unknown")
+
+    def __getattr__(self, item):
+        return getattr(self._provider, item)
+
+    async def complete(self, req):
+        resp = await self._provider.complete(req)
+        try:
+            cost = float(self._provider.cost_usd(resp))
+        except Exception:
+            cost = 0.0
+        if self._budget is not None:
+            self._budget.check_and_add(cost)
+        self._logger.log_call(
+            provider=self.name,
+            model=req.model,
+            request=asdict(req),
+            response={"text": resp.text, "model": resp.model, "raw": resp.raw},
+            latency_s=resp.latency_s,
+            cost_usd=cost,
+            input_tokens=resp.input_tokens,
+            output_tokens=resp.output_tokens,
+        )
+        return resp
 
 
 class BenchmarkRunner:
@@ -49,26 +114,16 @@ class BenchmarkRunner:
         bench = get_benchmark(benchmark_name)
         bench_config = self.config.get("benchmarks", {}).get(benchmark_name, {})
 
+        if self.logger is not None and not isinstance(provider, _LoggingProvider):
+            provider = _LoggingProvider(provider, self.logger, self.budget)
+
         all_results = {}
 
         for condition_name, condition_cfg in conditions.items():
             run_cfg = {**bench_config, **condition_cfg}
-            run_cfg["condition"] = condition_name
+            run_cfg.setdefault("condition", condition_name)
 
             raw_results = await bench.run(provider, model, run_cfg)
-
-            for item in raw_results.items:
-                if "call_id" in item:
-                    call = next((c for c in self.logger.load_calls() if c.call_id == item["call_id"]), None)
-                    if call:
-                        continue
-
-            for item in raw_results.items:
-                if "call_id" in item and "error" not in item:
-                    call_id = item["call_id"]
-                    call = next((c for c in self.logger.load_calls() if c.call_id == call_id), None)
-                    if not call:
-                        pass
 
             scores = bench.score(raw_results)
 
@@ -121,6 +176,8 @@ async def run_benchmarks(
         return {"run_id": run_id, "status": "dry_run", "estimated_cost": 0.0}
 
     provider, model = await runner.initialize(model_spec, max_usd)
+    if runner.logger is not None:
+        runner.logger.update_manifest(suite=suite)
 
     if conditions is None:
         conditions = config.get("conditions", {})
@@ -129,6 +186,7 @@ async def run_benchmarks(
                 "neutral": {"condition": "neutral", "temperature": 0.7, "num_samples": 10},
                 "creative": {"condition": "creative", "temperature": 0.7, "num_samples": 10},
             }
+    conditions = expand_conditions(conditions)
 
     if suite == "tier_a":
         results = await runner.run_tier_a(provider, model, conditions)

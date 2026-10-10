@@ -4,7 +4,7 @@ from typing import Any
 
 from jinja2 import Environment, select_autoescape
 
-from cbf.benchmarks import get_benchmark
+from cbf.benchmarks import get_benchmark, list_benchmarks
 from cbf.benchmarks.base import RawResults
 from cbf.storage import load_calls, load_manifest
 
@@ -16,7 +16,9 @@ def load_run_results(run_id: str, runs_dir: str = "runs") -> dict[str, Any]:
 
     calls = load_calls(run_id, runs_dir)
 
-    benchmark_id = manifest.config_hash.split("_")[0] if "_" in manifest.config_hash else "dat"
+    suite = getattr(manifest, "suite", "") or ""
+    candidates = [s.strip() for s in suite.split(",") if s.strip()]
+    benchmark_id = next((c for c in candidates if c in list_benchmarks()), "dat")
     try:
         bench = get_benchmark(benchmark_id)
     except ValueError:

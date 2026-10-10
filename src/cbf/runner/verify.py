@@ -1,6 +1,7 @@
 from pathlib import Path
 
-from cbf.benchmarks import get_benchmark
+from cbf.benchmarks import get_benchmark, list_benchmarks
+from cbf.benchmarks.base import RawResults
 from cbf.storage import load_calls, load_manifest
 
 
@@ -27,29 +28,31 @@ def verify_run(run_id: str, runs_dir: str = "runs") -> dict:
     if not calls:
         return {"success": False, "error": f"No call logs found for run {run_id}"}
 
-    benchmark_id = manifest.config_hash.split("_")[0] if "_" in manifest.config_hash else "dat"
+    suite = getattr(manifest, "suite", "") or ""
+    candidates = [s.strip() for s in suite.split(",") if s.strip()]
+    benchmark_id = next((c for c in candidates if c in list_benchmarks()), "dat")
     try:
         bench = get_benchmark(benchmark_id)
     except ValueError:
         return {"success": False, "error": f"Unknown benchmark: {benchmark_id}"}
 
-    raw_results = {
-        "benchmark_id": benchmark_id,
-        "model": manifest.models[0] if manifest.models else "unknown",
-        "items": [],
-        "call_ids": [c.call_id for c in calls],
-        "metadata": {},
-    }
+    raw_results = RawResults(
+        benchmark_id=benchmark_id,
+        model=manifest.models[0] if manifest.models else "unknown",
+        items=[],
+        call_ids=[c.call_id for c in calls],
+        metadata={},
+    )
 
     for call in calls:
         if call.error:
-            raw_results["items"].append({
+            raw_results.items.append({
                 "call_id": call.call_id,
                 "error": call.error,
             })
             continue
 
-        raw_results["items"].append({
+        raw_results.items.append({
             "call_id": call.call_id,
             "response": call.response.get("text", "") if call.response else "",
             "latency_s": call.latency_s,
@@ -62,7 +65,7 @@ def verify_run(run_id: str, runs_dir: str = "runs") -> dict:
         "success": True,
         "run_id": run_id,
         "benchmark": benchmark_id,
-        "model": raw_results["model"],
+        "model": raw_results.model,
         "computed_scores": scores.metrics,
         "stored_manifest": {
             "total_cost_usd": manifest.total_cost_usd,

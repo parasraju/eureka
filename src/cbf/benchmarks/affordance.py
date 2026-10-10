@@ -67,7 +67,10 @@ def score_solution(steps: list[str], task: dict) -> dict:
     """Deterministic feasibility/novelty signals from the raw output. No fabricated ratings."""
     text = " ".join(steps).lower()
     objects = [o.lower() for o in task["objects"]]
-    used_objects = [o for o in objects if o in text or any(w in text for w in o.split())]
+    used_objects = [
+        o for o in objects
+        if o in text or any(w in text and len(w) > 2 for w in o.split())
+    ]
     missing_tool = task["missing_tool"].lower()
     tool_leak = missing_tool in text and f"without {missing_tool}" not in text and f"no {missing_tool}" not in text
     magic = bool(MISSING_TOOL_MARKER.search(text))

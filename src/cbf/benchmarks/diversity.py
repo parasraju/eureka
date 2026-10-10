@@ -144,8 +144,9 @@ class DiversityBenchmark:
         all_distinct_2 = []
         all_self_bleu = []
         all_num_clusters = []
+        per_prompt_stats: dict[int, dict] = {}
 
-        for _prompt_idx, items in by_prompt.items():
+        for prompt_idx, items in by_prompt.items():
             texts = [item["text"] for item in items if item.get("text")]
             if len(texts) < 2:
                 continue
@@ -169,6 +170,12 @@ class DiversityBenchmark:
 
             quality = num_clusters * mean_dist
             all_quality.append(quality)
+
+            per_prompt_stats[prompt_idx] = {
+                "diversity": mean_dist,
+                "quality": quality,
+                "clusters": num_clusters,
+            }
 
         def ci(data):
             return mean_ci(data)
@@ -197,14 +204,7 @@ class DiversityBenchmark:
                 "composite": ci([d * q for d, q in zip(all_diversity, all_quality, strict=False)]) if all_diversity and all_quality else (0.0, 0.0),
             },
             metadata={
-                "per_prompt": {
-                    str(idx): {
-                        "diversity": all_diversity[i],
-                        "quality": all_quality[i],
-                        "clusters": all_num_clusters[i],
-                    }
-                    for i, idx in enumerate(by_prompt.keys())
-                }
+                "per_prompt": {str(idx): stats for idx, stats in per_prompt_stats.items()}
             },
         )
 

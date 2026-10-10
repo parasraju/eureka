@@ -2,7 +2,7 @@ import asyncio
 import hashlib
 import json
 from dataclasses import asdict, dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
 from .sources.arxiv import ArxivConfig, ArxivSource
@@ -108,13 +108,15 @@ class DiscoveryEngine:
             if kw in text:
                 score += 0.05
 
-        if candidate.get("citationCount", 0) > 10:
+        citations = candidate.get("citationCount") or 0
+        if citations > 10:
             score += 0.1
-        if candidate.get("citationCount", 0) > 100:
+        if citations > 100:
             score += 0.1
-        if candidate.get("stars", 0) > 50:
+        stars = candidate.get("stars") or 0
+        if stars > 50:
             score += 0.1
-        if candidate.get("stars", 0) > 500:
+        if stars > 500:
             score += 0.1
 
         published = candidate.get("published") or candidate.get("year") or candidate.get("published_at")
@@ -124,7 +126,9 @@ class DiscoveryEngine:
                     pub_date = datetime.fromisoformat(published.replace("Z", "+00:00"))
                 else:
                     pub_date = datetime(published, 1, 1)
-                days_old = (datetime.utcnow() - pub_date).days
+                if pub_date.tzinfo is None:
+                    pub_date = pub_date.replace(tzinfo=UTC)
+                days_old = (datetime.now(UTC) - pub_date).days
                 if days_old < 365:
                     score += 0.1
                 if days_old < 90:

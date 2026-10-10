@@ -1,6 +1,6 @@
 import asyncio
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 
 import arxiv
 
@@ -58,6 +58,7 @@ class ArxivSource:
     async def search_all(self) -> list[dict]:
         all_results = []
         seen_ids = set()
+        cutoff = datetime.now(UTC) - timedelta(days=self.config.days_back) if self.config.days_back else None
 
         for keyword in self.config.keywords:
             for category in self.config.categories:
@@ -65,6 +66,13 @@ class ArxivSource:
                 try:
                     results = await self.search(query)
                     for r in results:
+                        if cutoff is not None and r.get("published"):
+                            try:
+                                published = datetime.fromisoformat(r["published"])
+                            except ValueError:
+                                published = None
+                            if published is not None and published < cutoff:
+                                continue
                         if r["arxiv_id"] not in seen_ids:
                             seen_ids.add(r["arxiv_id"])
                             all_results.append(r)

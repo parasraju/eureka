@@ -124,8 +124,8 @@ Example format: word1, word2, word3, word4, word5, word6, word7, word8, word9, w
         if self._glove_vectors is not None:
             return self._glove_vectors
 
-        if self.config.glove_path and Path(self.config.glove_path).exists():
-            path = self.config.glove_path
+        if self.config.glove_path:
+            path = Path(self.config.glove_path)
         else:
             cache_dir = Path.home() / ".cache" / "cbf" / "glove"
             cache_dir.mkdir(parents=True, exist_ok=True)

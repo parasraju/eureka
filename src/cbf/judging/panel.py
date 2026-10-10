@@ -391,7 +391,7 @@ async def run_writing_elo_with_judges(
             item_ids.append(item_id)
 
             req = LLMRequest(
-                model=model,
+                model=model.split(":", 1)[1] if ":" in model else model,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=temperature,
                 max_tokens=500,

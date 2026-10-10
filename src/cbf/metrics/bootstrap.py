@@ -44,7 +44,7 @@ def t_ci(values: list[float] | np.ndarray, alpha: float = 0.05) -> tuple[float, 
         return (m, m)
     mean = float(np.mean(arr))
     sem = _stats.sem(arr)
-    low, high = _stats.t.interval(alpha, arr.size - 1, loc=mean, scale=sem)
+    low, high = _stats.t.interval(1 - alpha, arr.size - 1, loc=mean, scale=sem)
     return (float(low), float(high))
 
 

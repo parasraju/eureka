@@ -17,6 +17,8 @@ class CallLogEntry:
     response: dict
     latency_s: float
     cost_usd: float
+    input_tokens: int = 0
+    output_tokens: int = 0
     error: str | None = None
 
 
@@ -35,6 +37,7 @@ class RunManifest:
     total_cost_usd: float = 0.0
     total_calls: int = 0
     status: str = "running"
+    suite: str = ""
     error: str | None = None
 
 
@@ -83,6 +86,8 @@ class CallLogger:
         latency_s: float,
         cost_usd: float,
         error: str | None = None,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
     ) -> str:
         call_id = str(uuid.uuid4())
         entry = CallLogEntry(
@@ -95,6 +100,8 @@ class CallLogger:
             response=response or {},
             latency_s=latency_s,
             cost_usd=cost_usd,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
             error=error,
         )
 

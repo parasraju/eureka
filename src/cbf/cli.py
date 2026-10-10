@@ -9,7 +9,7 @@ from rich.console import Console
 from rich.table import Table
 
 from cbf.providers import build_registry_from_settings, parse_model_spec
-from cbf.runner import run_benchmarks
+from cbf.runner import expand_conditions, run_benchmarks
 from cbf.runner.verify import verify_run
 
 app = typer.Typer(name="cbf", help="AI Creative Benchmark Finder")
@@ -212,7 +212,7 @@ def run(
     """Run benchmarks against a model."""
     config = load_config()
 
-    conditions = config.get("conditions", {})
+    conditions = expand_conditions(config.get("conditions", {}))
     if not conditions:
         conditions = {
             "neutral": {"condition": "neutral", "temperature": 0.7, "num_samples": 10},
@@ -220,7 +220,8 @@ def run(
         }
 
     if condition:
-        conditions = {condition: conditions.get(condition, {"condition": condition})}
+        matched = {name: cfg for name, cfg in conditions.items() if cfg.get("condition") == condition}
+        conditions = matched or {condition: conditions.get(condition, {"condition": condition})}
 
     if num_samples:
         for cond in conditions.values():

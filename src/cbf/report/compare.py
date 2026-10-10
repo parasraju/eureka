@@ -22,9 +22,9 @@ DIMENSION_BOUNDS = {
 _METRIC_DIMENSIONS = {
     "dat": ("dat_score", "divergent_thinking", lambda v: v),
     "aut": ("fluency", "fluency", lambda v: v),
-    "diversity": ("diversity_score", "diversity", lambda v: v * 100.0),   # distance 0-1 -> 0-100
-    "associative": ("chain_validity", "chain_validity", lambda v: v * 100.0),
-    "affordance": ("feasibility", "repurposing", lambda v: v * 100.0),
+    "diversity": ("diversity_score", "diversity", lambda v: v),   # distance 0-1, normalized against bounds
+    "associative": ("chain_validity", "chain_validity", lambda v: v),
+    "affordance": ("feasibility", "repurposing", lambda v: v),
     "writing_elo": ("elo_rating", "writing_elo", lambda v: v),
 }
 
