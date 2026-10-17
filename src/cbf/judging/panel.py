@@ -1,4 +1,5 @@
 import asyncio
+import re
 from dataclasses import dataclass, field
 
 import krippendorff
@@ -7,6 +8,32 @@ from scipy import stats
 
 from cbf.benchmarks import BenchmarkItem, RawResults, Scores
 from cbf.providers import LLMProvider, LLMRequest
+
+_WINNER_RE = re.compile(r"\b(A|B|TIE)\b")
+_WINNER_RE_CI = re.compile(r"\b(A|B|TIE)\b", re.IGNORECASE)
+_LEADING_WINNER_RE = re.compile(r"^[^A-Za-z0-9]*(A|B|TIE)\b", re.IGNORECASE)
+
+
+def parse_winner(text: str) -> str:
+    """Extract a decision from a judge response as "a", "b", or "tie".
+
+    Tries, in order: a leading token in the first line, then an uppercase
+    standalone token (judges are told to answer with ONLY A/B/TIE), then a
+    case-insensitive standalone token. Undecidable responses are ties.
+    """
+    if not text or not text.strip():
+        return "tie"
+    stripped = text.strip()
+    first_line = stripped.splitlines()[0]
+
+    match = _LEADING_WINNER_RE.search(first_line)
+    if not match:
+        match = _WINNER_RE.search(first_line) or _WINNER_RE.search(stripped)
+    if not match:
+        match = _WINNER_RE_CI.search(first_line) or _WINNER_RE_CI.search(stripped)
+    if not match:
+        return "tie"
+    return {"A": "a", "B": "b", "TIE": "tie"}[match.group(1).upper()]
 
 
 @dataclass
@@ -92,13 +119,10 @@ Then provide a brief reasoning (1-2 sentences)."""
         )
 
         resp = await provider.complete(req)
-        response_text = resp.text.strip().upper()
 
-        winner = "tie"
-        if response_text.startswith("A"):
-            winner = "b" if swap else "a"
-        elif response_text.startswith("B"):
-            winner = "a" if swap else "b"
+        winner = parse_winner(resp.text)
+        if swap and winner != "tie":
+            winner = "b" if winner == "a" else "a"
 
         return PairwiseResult(
             item_a_id=item_a_id,
@@ -106,7 +130,7 @@ Then provide a brief reasoning (1-2 sentences)."""
             winner=winner,
             judge=judge_model,
             position_swapped=swap,
-            reasoning=response_text,
+            reasoning=resp.text.strip(),
             raw_response=resp.text,
         )
 
@@ -152,6 +176,50 @@ Then provide a brief reasoning (1-2 sentences)."""
         return results
 
 
+def resolve_pairs(results: list[PairwiseResult]) -> list[PairwiseResult]:
+    """Collapse repeated judgments of the same pair (e.g. position swaps) into one.
+
+    Agreement across orders -> that winner; any disagreement -> a tie; a single
+    decided judgment among ties -> that winner. Returns results in first-seen order.
+    """
+    groups: dict[tuple, list[PairwiseResult]] = {}
+    order: list[tuple] = []
+    for r in results:
+        key = (tuple(sorted((r.item_a_id, r.item_b_id))), r.judge)
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(r)
+
+    resolved: list[PairwiseResult] = []
+    for key in order:
+        group = groups[key]
+        a_id, b_id = key[0]
+        decided = set()
+        for r in group:
+            if r.winner == "a":
+                decided.add(a_id)
+            elif r.winner == "b":
+                decided.add(b_id)
+        if len(decided) == 1:
+            winner_id = next(iter(decided))
+        else:
+            winner_id = None
+
+        winner = "a" if winner_id == a_id else "b" if winner_id == b_id else "tie"
+        base = group[0]
+        resolved.append(PairwiseResult(
+            item_a_id=a_id,
+            item_b_id=b_id,
+            winner=winner,
+            judge=key[1],
+            position_swapped=False,
+            reasoning=base.reasoning,
+            raw_response=base.raw_response,
+        ))
+    return resolved
+
+
 def compute_elo(
     results: list[PairwiseResult],
     k_factor: float = 32.0,
@@ -164,21 +232,22 @@ def compute_elo(
 
     ratings = dict.fromkeys(items, initial_rating)
 
-    for result in results:
-        if result.winner == "tie":
-            continue
+    for result in resolve_pairs(results):
+        a_id, b_id = result.item_a_id, result.item_b_id
+        r_a, r_b = ratings[a_id], ratings[b_id]
 
-        winner_id = result.item_a_id if result.winner == "a" else result.item_b_id
-        loser_id = result.item_b_id if result.winner == "a" else result.item_a_id
+        e_a = 1 / (1 + 10 ** ((r_b - r_a) / 400))
+        e_b = 1 - e_a
 
-        r_w = ratings[winner_id]
-        r_l = ratings[loser_id]
+        if result.winner == "a":
+            s_a, s_b = 1.0, 0.0
+        elif result.winner == "b":
+            s_a, s_b = 0.0, 1.0
+        else:
+            s_a, s_b = 0.5, 0.5
 
-        e_w = 1 / (1 + 10 ** ((r_l - r_w) / 400))
-        e_l = 1 / (1 + 10 ** ((r_w - r_l) / 400))
-
-        ratings[winner_id] += k_factor * (1 - e_w)
-        ratings[loser_id] += k_factor * (0 - e_l)
+        ratings[a_id] += k_factor * (s_a - e_a)
+        ratings[b_id] += k_factor * (s_b - e_b)
 
     return ratings
 
@@ -198,12 +267,17 @@ def compute_bradley_terry(
     item_to_idx = {item: i for i, item in enumerate(item_list)}
 
     wins = np.zeros((n, n))
-    for r in results:
-        if r.winner == "tie":
-            continue
-        i = item_to_idx[r.item_a_id if r.winner == "a" else r.item_b_id]
-        j = item_to_idx[r.item_b_id if r.winner == "a" else r.item_a_id]
-        wins[i, j] += 1
+    for r in resolve_pairs(results):
+        i = item_to_idx[r.item_a_id]
+        j = item_to_idx[r.item_b_id]
+        if r.winner == "a":
+            wins[i, j] += 1
+        elif r.winner == "b":
+            wins[j, i] += 1
+        else:
+            # Ties count as half a win to each side (Davidson-style smoothing).
+            wins[i, j] += 0.5
+            wins[j, i] += 0.5
 
     params = np.ones(n)
     for _ in range(max_iter):
@@ -229,28 +303,40 @@ def compute_bradley_terry(
 
 
 def compute_inter_judge_agreement(results: list[PairwiseResult]) -> dict:
-    judges = list({r.judge for r in results})
-    items = set()
-    for r in results:
-        items.add(r.item_a_id)
-        items.add(r.item_b_id)
-    item_list = sorted(items)
+    judges = sorted({r.judge for r in results})
+    item_list = sorted({r.item_a_id for r in results} | {r.item_b_id for r in results})
+    if len(judges) < 2:
+        return {
+            "krippendorff_alpha": 0.0,
+            "mean_spearman": 0.0,
+            "num_judges": len(judges),
+            "num_items": len(item_list),
+        }
 
-    judge_ratings = {}
+    judge_ratings: dict[str, dict[str, float]] = {}
+    rated_items: set[str] = set()
     for judge in judges:
-        judge_results = [r for r in results if r.judge == judge]
-        ratings = compute_elo(judge_results)
-        judge_ratings[judge] = [ratings.get(item, 1000) for item in item_list]
+        ratings = compute_elo([r for r in results if r.judge == judge])
+        judge_ratings[judge] = ratings
+        rated_items |= set(ratings)
+    item_list = sorted(rated_items)
 
-    matrix = np.array([judge_ratings[j] for j in judges])
-    alpha = krippendorff.alpha(reliability_data=matrix, level_of_measurement="interval")
+    matrix = np.array([[judge_ratings[j].get(item, np.nan) for item in item_list] for j in judges])
+    try:
+        alpha = krippendorff.alpha(reliability_data=matrix, level_of_measurement="interval")
+    except Exception:
+        alpha = np.nan
 
+    common = [it for it in item_list if all(it in judge_ratings[j] for j in judges)]
     spearman_corrs = []
-    for i in range(len(judges)):
-        for j in range(i + 1, len(judges)):
-            corr, _ = stats.spearmanr(judge_ratings[judges[i]], judge_ratings[judges[j]])
-            if not np.isnan(corr):
-                spearman_corrs.append(corr)
+    if len(common) >= 2:
+        for i in range(len(judges)):
+            for j in range(i + 1, len(judges)):
+                x = [judge_ratings[judges[i]][it] for it in common]
+                y = [judge_ratings[judges[j]][it] for it in common]
+                corr, _ = stats.spearmanr(x, y)
+                if not np.isnan(corr):
+                    spearman_corrs.append(corr)
 
     return {
         "krippendorff_alpha": float(alpha) if not np.isnan(alpha) else 0.0,

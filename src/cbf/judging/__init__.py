@@ -6,6 +6,8 @@ from .panel import (
     compute_bradley_terry,
     compute_elo,
     compute_inter_judge_agreement,
+    parse_winner,
+    resolve_pairs,
     run_writing_elo_with_judges,
 )
 
@@ -17,5 +19,7 @@ __all__ = [
     "compute_elo",
     "compute_bradley_terry",
     "compute_inter_judge_agreement",
+    "parse_winner",
+    "resolve_pairs",
     "run_writing_elo_with_judges",
 ]
