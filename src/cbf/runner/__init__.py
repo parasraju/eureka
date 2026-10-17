@@ -110,6 +110,16 @@ class BenchmarkRunner:
         config_str = yaml.dump(self.config, sort_keys=True)
         return hashlib.sha256(config_str.encode()).hexdigest()[:16]
 
+    def _resolve_logged_provider(self, model_spec: str):
+        """Resolve a judge model spec to a provider, wrapped so judge calls are logged."""
+        provider_name, _ = parse_model_spec(model_spec)
+        provider = self.registry.get(provider_name) if self.registry else None
+        if not provider:
+            raise ValueError(f"Judge provider {provider_name} not configured")
+        if self.logger is None:
+            return provider
+        return _LoggingProvider(provider, self.logger, self.budget)
+
     async def run_benchmark(self, provider, model: str, benchmark_name: str, conditions: dict) -> dict:
         bench = get_benchmark(benchmark_name)
         bench_config = self.config.get("benchmarks", {}).get(benchmark_name, {})
@@ -122,8 +132,14 @@ class BenchmarkRunner:
         for condition_name, condition_cfg in conditions.items():
             run_cfg = {**bench_config, **condition_cfg}
             run_cfg.setdefault("condition", condition_name)
+            if self.config.get("judges"):
+                run_cfg.setdefault("judges", self.config.get("judges"))
 
             raw_results = await bench.run(provider, model, run_cfg)
+
+            judge_fn = getattr(bench, "judge", None)
+            if callable(judge_fn):
+                await judge_fn(raw_results, run_cfg, self._resolve_logged_provider)
 
             scores = bench.score(raw_results)
 

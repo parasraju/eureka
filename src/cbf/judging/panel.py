@@ -1,6 +1,6 @@
 import asyncio
 import re
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 
 import krippendorff
 import numpy as np
@@ -59,13 +59,49 @@ class PairwiseResult:
     raw_response: str = ""
 
 
+def build_judge_config(raw) -> JudgeConfig:
+    """Normalize a config value into a JudgeConfig.
+
+    Accepts a list of ``provider:model`` specs, a dict with
+    ``models``/``judge_models`` + optional rubric/temperature/swap_position, or None.
+    """
+    if raw is None:
+        return JudgeConfig(judge_models=[])
+    if isinstance(raw, list):
+        return JudgeConfig(judge_models=[str(s) for s in raw])
+    if isinstance(raw, dict):
+        models = raw.get("models", raw.get("judge_models", []))
+        return JudgeConfig(
+            judge_models=[str(s) for s in models],
+            temperature=float(raw.get("temperature", 0.0)),
+            max_tokens=int(raw.get("max_tokens", 1000)),
+            rubric=raw.get("rubric", "") or "",
+            swap_position=bool(raw.get("swap_position", True)),
+        )
+    return JudgeConfig(judge_models=[])
+
+
+def judge_model_name(model_spec: str) -> str:
+    """The bare model name from a ``provider:model`` spec (or the spec unchanged)."""
+    return model_spec.split(":", 1)[1] if ":" in model_spec else model_spec
+
+
+def is_self_judge(judge_spec: str, model_under_test: str) -> bool:
+    """True when a judge is the same model being tested (self-preference risk)."""
+    return judge_model_name(judge_spec) == judge_model_name(model_under_test)
+
+
 class JudgePanel:
-    def __init__(self, config: JudgeConfig, provider_registry):
+    def __init__(self, config: JudgeConfig, provider_registry=None, providers: dict | None = None):
         self.config = config
         self.provider_registry = provider_registry
-        self.judges: dict[str, LLMProvider] = {}
+        self.judges: dict[str, LLMProvider] = dict(providers) if providers else {}
 
     async def initialize(self):
+        if self.judges:
+            return
+        if self.provider_registry is None:
+            raise ValueError("JudgePanel requires a provider_registry or explicit providers")
         for model_spec in self.config.judge_models:
             provider_name, model_name = model_spec.split(":", 1)
             provider = self.provider_registry.get(provider_name)
@@ -334,6 +370,8 @@ def compute_inter_judge_agreement(results: list[PairwiseResult]) -> dict:
             for j in range(i + 1, len(judges)):
                 x = [judge_ratings[judges[i]][it] for it in common]
                 y = [judge_ratings[judges[j]][it] for it in common]
+                if len(set(x)) < 2 or len(set(y)) < 2:
+                    continue
                 corr, _ = stats.spearmanr(x, y)
                 if not np.isnan(corr):
                     spearman_corrs.append(corr)
@@ -427,6 +465,53 @@ class WritingEloBenchmark:
             metadata={"config": cfg, "k": k},
         )
 
+    async def judge(self, raw: RawResults, cfg: dict, resolve_provider) -> None:
+        """Run the judge panel over this run's texts and store pairwise results.
+
+        ``resolve_provider(model_spec)`` returns a (logging-wrapped) LLMProvider.
+        Called by the runner after ``run()``; a no-op when no judges are configured.
+        """
+        judge_config = build_judge_config(cfg.get("judges"))
+        if not judge_config.judge_models:
+            return
+
+        selected = [s for s in judge_config.judge_models if not is_self_judge(s, raw.model)]
+        filtered = [s for s in judge_config.judge_models if is_self_judge(s, raw.model)]
+        if not selected:
+            raise ValueError(
+                "All configured judges are the model under test (self-preference); "
+                "configure at least one independent judge."
+            )
+
+        judge_config.judge_models = selected
+        if not judge_config.rubric:
+            judge_config.rubric = self.rubric
+
+        if resolve_provider is None:
+            raise ValueError("Judging requires a provider resolver to log judge calls")
+
+        providers = {spec: resolve_provider(spec) for spec in selected}
+        panel = JudgePanel(judge_config, providers=providers)
+        await panel.initialize()
+
+        texts: dict[str, str] = {}
+        for item in raw.items:
+            if "error" in item:
+                continue
+            item_id = f"p{item.get('prompt_idx', 0)}_g{item.get('generation_idx', 0)}"
+            texts[item_id] = item.get("text", "")
+
+        pairwise: list[PairwiseResult] = []
+        if len(texts) >= 2:
+            pairwise = await panel.judge_all_pairs(texts, list(texts.keys()))
+
+        raw.metadata["pairwise"] = [asdict(p) for p in pairwise]
+        raw.metadata["judge"] = {
+            "models": selected,
+            "filtered_self_judges": filtered,
+            "swap_position": judge_config.swap_position,
+        }
+
     def score(self, raw: RawResults) -> Scores:
         by_prompt: dict[int, list[dict]] = {}
         for item in raw.items:
@@ -444,11 +529,29 @@ class WritingEloBenchmark:
                 metrics={"elo_rating": 0.0, "agreement": 0.0},
             )
 
+        metrics: dict[str, float] = {
+            "items_generated": len(raw.items),
+            "prompts_tested": len(by_prompt),
+        }
+        metadata: dict = {"by_prompt": {str(k): len(v) for k, v in by_prompt.items()}}
+        if raw.metadata.get("judge"):
+            metadata["judge"] = raw.metadata["judge"]
+
+        pairwise = [PairwiseResult(**p) for p in raw.metadata.get("pairwise", [])]
+        if pairwise:
+            elo = compute_elo(pairwise)
+            bt = compute_bradley_terry(pairwise)
+            agreement = compute_inter_judge_agreement(pairwise)
+            metrics["elo_rating"] = float(np.mean(list(elo.values()))) if elo else 0.0
+            metrics["bt_rating"] = float(np.mean(list(bt.values()))) if bt else 0.0
+            metrics["agreement"] = agreement["krippendorff_alpha"]
+            metrics["reliable"] = 1.0 if agreement["num_judges"] >= 2 else 0.0
+
         return Scores(
             benchmark_id=self.id,
             model=raw.model,
-            metrics={"items_generated": len(raw.items), "prompts_tested": len(by_prompt)},
-            metadata={"by_prompt": {str(k): len(v) for k, v in by_prompt.items()}},
+            metrics=metrics,
+            metadata=metadata,
         )
 
 

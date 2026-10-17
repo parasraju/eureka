@@ -208,9 +208,20 @@ def run(
     temperature: float = typer.Option(None, "--temperature", "-t", help="Temperature for generation"),
     max_usd: float = typer.Option(None, "--max-usd", help="Maximum budget in USD"),
     dry_run: bool = typer.Option(False, "--dry-run", help="Estimate cost without making calls"),
+    judges: str = typer.Option(None, "--judges", help="Comma-separated judge specs (provider:model); overrides config"),
+    rubric: str = typer.Option(None, "--rubric", help="Override the judge rubric text"),
 ):
     """Run benchmarks against a model."""
     config = load_config()
+
+    if judges or rubric:
+        existing = config.get("judges")
+        judge_cfg = dict(existing) if isinstance(existing, dict) else {"models": list(existing or [])}
+        if judges:
+            judge_cfg["models"] = [s.strip() for s in judges.split(",") if s.strip()]
+        if rubric:
+            judge_cfg["rubric"] = rubric
+        config["judges"] = judge_cfg
 
     conditions = expand_conditions(config.get("conditions", {}))
     if not conditions:
