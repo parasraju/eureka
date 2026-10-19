@@ -1,5 +1,18 @@
 import numpy as np
 from sklearn.metrics.pairwise import cosine_distances
+from sentence_transformers import SentenceTransformer
+
+
+_embed_model: SentenceTransformer | None = None
+_embed_model_name: str = ""
+
+
+def _get_model(model_name: str) -> SentenceTransformer:
+    global _embed_model, _embed_model_name
+    if _embed_model is None or _embed_model_name != model_name:
+        _embed_model = SentenceTransformer(model_name)
+        _embed_model_name = model_name
+    return _embed_model
 
 
 def mean_pairwise_distance(embeddings: np.ndarray) -> float:
@@ -35,7 +48,5 @@ def cluster_by_similarity(embeddings: np.ndarray, threshold: float = 0.75) -> li
 
 
 def embed_texts(texts: list[str], model_name: str = "sentence-transformers/all-MiniLM-L6-v2") -> np.ndarray:
-    from sentence_transformers import SentenceTransformer
-
-    model = SentenceTransformer(model_name)
+    model = _get_model(model_name)
     return model.encode(texts, convert_to_numpy=True, normalize_embeddings=True)

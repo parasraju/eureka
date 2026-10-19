@@ -120,38 +120,47 @@ Example format: word1, word2, word3, word4, word5, word6, word7, word8, word9, w
                 cleaned.append(w)
         return cleaned[:self.config.num_words]
 
-    def _load_glove(self) -> dict[str, np.ndarray]:
-        if self._glove_vectors is not None:
-            return self._glove_vectors
+    _glove_cache: dict[str, dict[str, np.ndarray]] = {}
 
-        if self.config.glove_path:
-            path = Path(self.config.glove_path)
-        else:
-            cache_dir = Path.home() / ".cache" / "cbf" / "glove"
-            cache_dir.mkdir(parents=True, exist_ok=True)
-            path = cache_dir / "glove.6B.300d.txt"
 
-        if not path.exists():
-            raise FileNotFoundError(
-                f"GloVe vectors not found at {path}. Download from https://nlp.stanford.edu/projects/glove/ "
-                f"or set DATConfig.glove_path"
-            )
+def _get_glove_vectors(config: DATConfig) -> dict[str, np.ndarray]:
+    """Cache GloVe vectors per config (by glove path or default cache dir)."""
+    cache_key = config.glove_path or "default"
+    if cache_key in _glove_cache:
+        return _glove_cache[cache_key]
 
-        vectors = {}
-        with open(path, encoding="utf-8") as f:
-            for line in f:
-                parts = line.strip().split()
-                if len(parts) == self._glove_dim + 1:
-                    word = parts[0]
-                    vec = np.array([float(x) for x in parts[1:]], dtype=np.float32)
-                    vectors[word] = vec
+    from pathlib import Path
+    import numpy as np
 
-        self._glove_vectors = vectors
-        return vectors
+    if config.glove_path:
+        path = Path(config.glove_path)
+    else:
+        cache_dir = Path.home() / ".cache" / "cbf" / "glove"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        path = cache_dir / "glove.6B.300d.txt"
+
+    if not path.exists():
+        raise FileNotFoundError(
+            f"GloVe vectors not found at {path}. Download from https://nlp.stanford.edu/projects/glove/ "
+            f"or set DATConfig.glove_path"
+        )
+
+    vectors = {}
+    _dim = 300
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            parts = line.strip().split()
+            if len(parts) == _dim + 1:
+                word = parts[0]
+                vec = np.array([float(x) for x in parts[1:]], dtype=np.float32)
+                vectors[word] = vec
+
+    _glove_cache[cache_key] = vectors
+    return vectors
 
     def _get_word_vectors(self, words: list[str]) -> np.ndarray:
         if self.config.embedding_model == "glove":
-            glove = self._load_glove()
+            glove = _get_glove_vectors(self.config)
             vecs = []
             for w in words:
                 if w in glove:

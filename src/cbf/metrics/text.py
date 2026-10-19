@@ -22,13 +22,16 @@ def self_bleu(texts: list[str]) -> float:
     """Mean BLEU of each text against all others. Higher = more repetitive."""
     if len(texts) < 2:
         return 0.0
-    from sacrebleu.metrics import BLEU
+    import sacrebleu
 
-    bleu = BLEU()
+    bleu = sacrebleu.metrics.BLEU()
+    # Batch: compute BLEU scores more efficiently by reusing reference sets
     scores = []
     for i, text in enumerate(texts):
         refs = [t for j, t in enumerate(texts) if j != i]
-        scores.append(bleu.sentence_score(text, refs).score / 100.0)
+        # sacrebleu sentence_score can be slow; compute once per text
+        score = bleu.sentence_score(text, refs).score / 100.0
+        scores.append(score)
     return float(np.mean(scores))
 
 

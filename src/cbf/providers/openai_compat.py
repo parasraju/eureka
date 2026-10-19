@@ -6,6 +6,7 @@ from openai import AsyncOpenAI
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential_jitter
 
 from .base import LLMRequest, LLMResponse, ProviderConfig, generate_request_id
+from .rate_limiter import rate_limited_complete, rate_limited_embed, get_global_limiter, set_global_limiter
 
 
 class OpenAICompatibleProvider:
@@ -44,7 +45,14 @@ class OpenAICompatibleProvider:
             kwargs["seed"] = req.seed
         kwargs.update(req.extra)
 
-        response = await self.client.chat.completions.create(**kwargs)
+        # Use rate-limited complete if global limiter is set
+        from .rate_limiter import rate_limited_complete as _rl_complete
+
+        response = await _rl_complete(
+            self,
+            req,
+            rate_limiter=get_global_limiter(),
+        )
 
         latency = time.perf_counter() - start
         choice = response.choices[0]
@@ -72,8 +80,15 @@ class OpenAICompatibleProvider:
         retry=retry_if_exception_type((httpx.TimeoutException, httpx.NetworkError, httpx.HTTPStatusError)),
     )
     async def embed(self, texts: list[str], model: str) -> list[list[float]]:
-        response = await self.client.embeddings.create(model=model, input=texts)
-        return [d.embedding for d in response.data]
+        # Use rate-limited embed if global limiter is set
+        from .rate_limiter import rate_limited_embed as _rl_embed
+
+        return await _rl_embed(
+            self,
+            texts,
+            model,
+            rate_limiter=get_global_limiter(),
+        )
 
     def cost_usd(self, resp: LLMResponse) -> float:
         model = resp.model.lower()
