@@ -208,6 +208,11 @@ def run(
     temperature: float = typer.Option(None, "--temperature", "-t", help="Temperature for generation"),
     max_usd: float = typer.Option(None, "--max-usd", help="Maximum budget in USD"),
     dry_run: bool = typer.Option(False, "--dry-run", help="Estimate cost without making calls"),
+    private_prompts: bool = typer.Option(
+        False,
+        "--private-prompts/--no-private-prompts",
+        help="Use private prompt variants when the benchmark supports them (default: off)",
+    ),
     judges: str = typer.Option(None, "--judges", help="Comma-separated judge specs (provider:model); overrides config"),
     rubric: str = typer.Option(None, "--rubric", help="Override the judge rubric text"),
 ):
@@ -242,6 +247,19 @@ def run(
         for cond in conditions.values():
             cond["temperature"] = temperature
 
+    for cond in conditions.values():
+        cond["private_prompts"] = private_prompts
+
+    estimate = None
+    if dry_run:
+        from cbf.runner.estimate import estimate_run_cost
+
+        estimate = estimate_run_cost(config, suite, conditions, model)
+        rprint(
+            f"[yellow]Estimated dry run: {estimate['calls']} calls, "
+            f"${estimate['total_usd']:.2f} USD[/yellow]"
+        )
+
     rprint(f"[cyan]Starting run for {model} with suite={suite}[/cyan]")
     rprint(f"Conditions: {list(conditions.keys())}")
 
@@ -256,7 +274,14 @@ def run(
         ))
 
         if result.get("status") == "dry_run":
-            rprint(f"[yellow]Dry run completed. Run ID: {result['run_id']}[/yellow]")
+            if estimate is not None:
+                rprint(
+                    f"[yellow]Dry run completed: {estimate['calls']} calls, "
+                    f"${estimate['total_usd']:.2f} USD estimated. "
+                    f"Run ID: {result['run_id']}[/yellow]"
+                )
+            else:
+                rprint(f"[yellow]Dry run completed. Run ID: {result['run_id']}[/yellow]")
             return
 
         rprint(f"[green]Run completed! Run ID: {result['run_id']}[/green]")
@@ -459,6 +484,80 @@ def compare(
         rprint(f"[green]Comparison saved to {output}[/green]")
     else:
         print(content)
+
+
+@app.command()
+def rate(
+    runs: str = typer.Argument(..., help="Comma-separated run IDs (ideally one per model)"),
+    judge_model: str = typer.Option(
+        "openai:gpt-4o", "--judge-model", help="Judge model (provider:model)"
+    ),
+    benchmark: str = typer.Option(None, "--benchmark", help="Restrict judged items to one benchmark"),
+    max_pairs: int = typer.Option(80, "--max-pairs", help="Maximum cross-model pairs to judge"),
+    output: str = typer.Option(None, "--output", "-o", help="Write ratings JSON to a file"),
+    runs_dir: str = typer.Option("runs", "--runs-dir", help="Runs directory"),
+):
+    """Judge two or more runs cross-model and report Elo, Bradley-Terry, and win rate."""
+    import asyncio
+    import json
+
+    from cbf.judging.panel import JudgeConfig, JudgePanel, compute_model_ratings
+    from cbf.report import collect_texts_by_model
+
+    run_ids = [r.strip() for r in runs.split(",") if r.strip()]
+    texts, errors = collect_texts_by_model(run_ids, runs_dir, benchmark)
+    for err in errors:
+        rprint(f"[yellow]{err}[/yellow]")
+
+    models = sorted(texts)
+    if len(models) < 2:
+        rprint(f"[red]Need generated texts from at least 2 models; found {len(models)}.[/red]")
+        raise typer.Exit(1)
+
+    config = load_config()
+    registry = build_registry_from_settings(config)
+    if judge_model.split(":", 1)[0] not in registry.list_names():
+        rprint(f"[red]Judge provider not configured: {judge_model}[/red]")
+        raise typer.Exit(1)
+
+    panel = JudgePanel(
+        JudgeConfig(judge_models=[judge_model], max_pairs=max_pairs),
+        provider_registry=registry,
+    )
+
+    async def _judge():
+        await panel.initialize()
+        return await panel.judge_models_pairwise(texts, max_pairs=max_pairs)
+
+    results = asyncio.run(_judge())
+    ratings = compute_model_ratings(results, {})
+    payload = {
+        "models": models,
+        "judge": judge_model,
+        "pairs_judged": len(results),
+        "invalid_rate": ratings["invalid_rate"],
+        "elo": ratings["elo"],
+        "bt": ratings["bt"],
+        "win_rate": ratings["win_rate"],
+    }
+
+    if output:
+        with open(output, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, sort_keys=True)
+        rprint(f"[green]Ratings saved to {output}[/green]")
+        return
+
+    print(
+        f"Judge: {judge_model}  pairs: {len(results)}  "
+        f"invalid: {ratings['invalid_rate']:.1%}"
+    )
+    print(f"{'model':<40} {'elo':>8} {'bt':>8} {'win_rate':>9}")
+    for model in sorted(models, key=lambda m: ratings["elo"].get(m, 0.0), reverse=True):
+        print(
+            f"{model:<40} {ratings['elo'].get(model, 0.0):>8.1f} "
+            f"{ratings['bt'].get(model, 0.0):>8.3f} "
+            f"{ratings['win_rate'].get(model, 0.0):>9.3f}"
+        )
 
 
 @app.command()

@@ -1,4 +1,19 @@
-"""Candidate scoring: relevance, runnability, credibility, recency (plan section 3.2)."""
+﻿"""Candidate scoring: relevance, runnability, credibility, recency.
+
+Composite weights (documented here and enforced in :func:`rank_candidate`):
+    0.40 * relevance + 0.25 * runnability + 0.25 * credibility + 0.10 * recency
+
+Runnability weights:
+    +0.40 explicit code repository (repo_url/code_url or a GitHub/GitLab/Bitbucket URL)
+    +0.25 dataset URL
+    +0.20 recognised license
+    +0.15/0.08 repository stars (>50 / >10)
+
+Credibility weights:
+    base 0.20, +0.30 explicit peer-reviewed signal, -0.10 explicit unreviewed,
+    +0.15 explicit venue match, +0.25/0.15/0.05 citations (>100/>10/>0),
+    +0.10 reproducible or explicit has_code. All component scores are clamped to 0..1.
+"""
 
 import re
 from dataclasses import asdict, dataclass, field
@@ -19,6 +34,11 @@ LLM_KEYWORDS = [
 ]
 PREPRINT_RE = re.compile(r"arxiv|preprint|under review", re.IGNORECASE)
 VENUES = ["neurips", "icml", "iclr", "acl", "emnlp", "aaai", "acl findings", "journal"]
+REPO_HOSTS = ("github.com", "gitlab.com", "bitbucket.org")
+REPO_FIELD_KEYS = ("repo_url", "code_url", "repository_url", "repository", "code")
+VENUE_FIELD_KEYS = (
+    "venue", "publication_venue", "publicationVenue", "journal", "conference", "booktitle",
+)
 
 
 @dataclass
@@ -44,6 +64,31 @@ def _clamp(v: float) -> float:
     return max(0.0, min(1.0, v))
 
 
+def _is_repo_url(value: object) -> bool:
+    lower = str(value or "").lower()
+    return any(host in lower for host in REPO_HOSTS)
+
+
+def _explicit_venue(candidate: dict) -> str:
+    for key in VENUE_FIELD_KEYS:
+        value = candidate.get(key)
+        if value:
+            return str(value)
+    return ""
+
+
+def _has_code(candidate: dict, code_url: str = "") -> bool:
+    """True only for explicit repository fields or GitHub/GitLab/Bitbucket URLs.
+
+    A bare ``html_url`` (for example an arXiv abstract page) is not evidence of code.
+    """
+    if code_url:
+        return True
+    if any(candidate.get(key) for key in REPO_FIELD_KEYS):
+        return True
+    return any(_is_repo_url(candidate.get(key)) for key in ("html_url", "url", "homepage", "website"))
+
+
 def relevance_score(text: str) -> float:
     lower = text.lower()
     score = 0.0
@@ -55,7 +100,7 @@ def relevance_score(text: str) -> float:
 
 def runnability_score(candidate: dict, code_url: str = "", data_url: str = "", license_name: str = "") -> float:
     score = 0.0
-    has_code = bool(code_url) or bool(candidate.get("repo_url")) or bool(candidate.get("html_url"))
+    has_code = _has_code(candidate, code_url)
     has_data = bool(data_url) or bool(candidate.get("dataset_url"))
     if has_code:
         score += 0.40
@@ -72,19 +117,20 @@ def runnability_score(candidate: dict, code_url: str = "", data_url: str = "", l
 
 
 def credibility_score(candidate: dict, peer_reviewed: bool | None = None) -> float:
+    """Credibility from explicit signals only; text mentions of arXiv are not peer review."""
     score = 0.20
-    text = " ".join(str(candidate.get(k, "")) for k in ("title", "summary", "abstract", "venue", "published")).lower()
+    explicit_venue = _explicit_venue(candidate)
+
     if peer_reviewed is True:
         score += 0.30
     elif peer_reviewed is False:
         score -= 0.10
-    elif PREPRINT_RE.search(text):
-        score -= 0.05
-
-    for venue in VENUES:
-        if venue in text:
+    elif explicit_venue:
+        lowered = explicit_venue.lower()
+        if PREPRINT_RE.search(lowered):
+            score -= 0.05
+        elif any(venue in lowered for venue in VENUES):
             score += 0.15
-            break
 
     citations = candidate.get("citationCount", 0) or 0
     if citations > 100:
@@ -144,10 +190,15 @@ def rank_candidate(candidate: dict, min_score: float = 0.3, relevance_floor: flo
 
     score = _clamp(0.40 * rel + 0.25 * run + 0.25 * cred + 0.10 * rec)
 
+    venue_text = _explicit_venue(candidate)
+    preprint = meta.peer_reviewed is False or (
+        meta.peer_reviewed is None and bool(PREPRINT_RE.search(f"{text} {venue_text}"))
+    )
+
     reasons = [f"relevance={rel:.2f}", f"runnability={run:.2f}", f"credibility={cred:.2f}", f"recency={rec:.2f}"]
     if meta.unverified:
         reasons.append("unverified: " + ",".join(meta.unverified))
-    if meta.peer_reviewed is False:
+    if preprint:
         reasons.append("preprint (unreviewed)")
 
     if rel < relevance_floor:
@@ -155,7 +206,7 @@ def rank_candidate(candidate: dict, min_score: float = 0.3, relevance_floor: flo
         reasons.append(f"relevance {rel:.2f} below floor {relevance_floor}")
         score = _clamp(score * 0.25)
     else:
-        status = classify(score, min_score, preprint=meta.peer_reviewed is False)
+        status = classify(score, min_score, preprint=preprint)
         if score < min_score:
             reasons.append(f"below min_score {min_score}")
 

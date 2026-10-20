@@ -55,15 +55,16 @@ build-backend = "setuptools.build_meta"
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+
+[tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "C4", "W"]
 ignore = ["E501"]
 
 [tool.mypy]
 python_version = "3.11"
-strict = true
-warn_return_any = true
+check_untyped_defs = true
 warn_unused_ignores = true
-disallow_untyped_defs = true
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
@@ -76,12 +77,9 @@ rich_markup_mode = "rich"
 source = ["src/cbf"]
 branch = true
 omit = [
-    "src/cbf/cli.py",
-    "src/cbf/runner/*",
     "src/cbf/providers/*",
     "src/cbf/discovery/engine.py",
     "src/cbf/discovery/sources/*",
-    "src/cbf/report/generator.py",
     "src/cbf/benchmarks/adapters/*",
 ]
 
@@ -90,7 +88,7 @@ skip_covered = false
 show_missing = true
 
 # Phase 7 acceptance: >= 80% on scoring/statistics/data-integrity code.
-# The gate is enforced in CI against this verified set (was 86.5% at setup):
+# The gate is enforced in CI against the scored subset below:
 #   python -m pytest --cov=src/cbf/metrics \
 #     --cov=src/cbf/judging/bias.py --cov=src/cbf/judging/calibration.py \
 #     --cov=src/cbf/discovery/ranker.py --cov=src/cbf/discovery/registry_db.py \

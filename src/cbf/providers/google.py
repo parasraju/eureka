@@ -21,6 +21,7 @@ class GoogleProvider:
             ),
         )
         self._model_cache: list[str] | None = None
+        self._model_error: str | None = None
 
     @retry(
         wait=wait_exponential_jitter(initial=1, max=30),
@@ -107,17 +108,28 @@ class GoogleProvider:
     async def list_models(self) -> list[str]:
         if self._model_cache is not None:
             return self._model_cache
-        self._model_cache = [
-            "gemini-1.5-pro",
-            "gemini-1.5-flash",
-            "gemini-1.0-pro",
-        ]
-        return self._model_cache
+        try:
+            models = []
+            async for model in self.client.aio.models.list():
+                name = getattr(model, "name", "") or ""
+                if name:
+                    models.append(name.split("/")[-1])
+            self._model_cache = models
+            return self._model_cache
+        except Exception as e:
+            self._model_error = str(e)
+            return []
 
-    async def health_check(self) -> bool:
+    async def health_check(self, model: str | None = None) -> bool:
+        if model is None:
+            models = await self.list_models()
+            if not models:
+                detail = f": {self._model_error}" if self._model_error else ""
+                raise RuntimeError(f"No models available for provider {self.name}{detail}")
+            model = models[0]
         try:
             await self.client.aio.models.generate_content(
-                model="gemini-1.5-flash",
+                model=model,
                 contents=[types.Content(role="user", parts=[types.Part(text="ping")])],
                 config=types.GenerateContentConfig(max_output_tokens=5),
             )

@@ -6,7 +6,8 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from cbf.metrics import bootstrap_ci, distinct_n, embed_texts, mean_pairwise_distance
+from cbf import metrics as cbf_metrics
+from cbf.metrics import bootstrap_ci, distinct_n
 
 from .base import BenchmarkItem, RawResults, Scores
 
@@ -24,6 +25,7 @@ class AssociativeConfig:
     num_samples: int = 10
     temperature: float = 0.8
     st_model: str = "sentence-transformers/all-MiniLM-L6-v2"
+    connectivity_threshold: float = 0.35
 
 
 CHAIN_PROMPT = """Connect the concepts "{a}" and "{b}" with a chain of exactly {n} intermediate concepts.
@@ -52,6 +54,13 @@ def validate_chain(concepts: list[str], expected_hops: int, endpoints: tuple[str
         "distinct_endpoints": endpoints_absent,
         "n_concepts": len(concepts),
     }
+
+
+def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
+    denom = float(np.linalg.norm(a) * np.linalg.norm(b))
+    if denom == 0.0:
+        return 0.0
+    return float(np.dot(a, b) / denom)
 
 
 class AssociativeBenchmark:
@@ -127,6 +136,51 @@ class AssociativeBenchmark:
             metadata={"config": cfg, "hops": hops},
         )
 
+    def _compute_connectivity(self, valid_items: list[dict]) -> tuple[float, bool]:
+        """Fraction of valid chains whose every hop clears the embedding threshold.
+
+        Returns (connectivity, embeddings_unavailable). Unavailable is True only
+        when no chain could be embedded at all.
+        """
+        if not valid_items:
+            return 0.0, False
+
+        threshold = self.config.connectivity_threshold
+        passed: list[bool] = []
+        embedded_any = False
+
+        for item in valid_items:
+            pair = item.get("pair") or []
+            chain = item.get("chain") or []
+            if len(pair) != 2 or not chain:
+                passed.append(False)
+                continue
+
+            a, b = str(pair[0]).lower(), str(pair[1]).lower()
+            sequence = [a] + [str(c).lower() for c in chain] + [b]
+            try:
+                vectors = np.asarray(
+                    cbf_metrics.embed_texts(sequence, self.config.st_model), dtype=float
+                )
+            except Exception:
+                passed.append(False)
+                continue
+
+            if vectors.ndim != 2 or len(vectors) != len(sequence):
+                passed.append(False)
+                continue
+
+            embedded_any = True
+            hops_ok = all(
+                _cosine_similarity(vectors[i], vectors[i + 1]) >= threshold
+                for i in range(len(sequence) - 1)
+            )
+            passed.append(bool(hops_ok))
+
+        if not embedded_any:
+            return 0.0, True
+        return float(np.mean(passed)), False
+
     def score(self, raw: RawResults) -> Scores:
         valid_items = [i for i in raw.items if i.get("valid")]
         ok = [i for i in raw.items if "error" not in i]
@@ -136,33 +190,48 @@ class AssociativeBenchmark:
                 benchmark_id=self.id,
                 model=raw.model,
                 metrics={"chain_validity": 0.0, "connectivity": 0.0, "associative_diversity": 0.0},
-                metadata={"error": "no successful generations"},
+                metadata={
+                    "error": "no successful generations",
+                    "connectivity_method": "embedding-threshold",
+                    "connectivity_threshold": self.config.connectivity_threshold,
+                },
             )
 
         validity = len(valid_items) / len(ok)
-        completeness = float(np.mean([1.0 if i["validation"]["complete"] else 0.0 for i in ok]))
         no_dupes = float(np.mean([1.0 if i["validation"]["no_duplicates"] else 0.0 for i in ok]))
 
+        connectivity, connectivity_unavailable = self._compute_connectivity(valid_items)
+
         all_concepts = [c for i in valid_items for c in i.get("chain", [])]
-        concept_novelty = distinct_n([ " ".join(i.get("chain", [])) for i in valid_items], 2) if valid_items else 0.0
+        concept_novelty = distinct_n([" ".join(i.get("chain", [])) for i in valid_items], 2) if valid_items else 0.0
 
         diversity = 0.0
         if len(valid_items) >= 2:
             try:
-                embeddings = embed_texts([" ".join(i["chain"]) for i in valid_items], self.config.st_model)
-                diversity = mean_pairwise_distance(embeddings)
+                embeddings = cbf_metrics.embed_texts(
+                    [" ".join(i["chain"]) for i in valid_items], self.config.st_model
+                )
+                diversity = cbf_metrics.mean_pairwise_distance(embeddings)
             except Exception:
                 diversity = 0.0
 
         per_sample_validity = [1.0 if i.get("valid") else 0.0 for i in ok]
         ci = bootstrap_ci(per_sample_validity)
 
+        metadata = {
+            "unique_concepts": len(set(all_concepts)),
+            "connectivity_method": "embedding-threshold",
+            "connectivity_threshold": self.config.connectivity_threshold,
+        }
+        if connectivity_unavailable:
+            metadata["connectivity_unavailable"] = True
+
         return Scores(
             benchmark_id=self.id,
             model=raw.model,
             metrics={
                 "chain_validity": validity,
-                "connectivity": completeness,
+                "connectivity": connectivity,
                 "no_repeats": no_dupes,
                 "associative_diversity": float(diversity),
                 "concept_novelty": float(concept_novelty),
@@ -170,7 +239,7 @@ class AssociativeBenchmark:
                 "total_samples": len(ok),
             },
             confidence_intervals={"chain_validity": ci},
-            metadata={"unique_concepts": len(set(all_concepts))},
+            metadata=metadata,
         )
 
 

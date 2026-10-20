@@ -1,63 +1,104 @@
 """Global rate limiting for API calls.
 
-Provides per-provider rate limiting with Retry-After support,
-concurrency caps, and integration with tenacity-based retries.
+Provides per-provider rate limiting with monotonic timestamps, concurrency
+caps, and an optional acquisition timeout. The limiter never holds its lock
+while sleeping and never re-enters ``acquire`` recursively.
 """
 
 import asyncio
 import time
-from collections import defaultdict
-from typing import DefaultDict, Optional
+from collections import defaultdict, deque
+from typing import Any
+
+DEFAULT_TIMEOUT = 120.0
 
 
 class RateLimiter:
-    """Token bucket rate limiter per provider."""
+    """Rate limiter with per-second/per-minute quotas and a concurrency cap.
 
-    def __init__(self, calls_per_minute: int | None = None, calls_per_second: float | None = None, max_concurrency: int | None = None):
+    ``acquire`` reserves a slot; ``release`` (or the async context manager)
+    gives the concurrency slot back. Rate-limit timestamps are recorded at
+    acquisition time and pruned lazily using ``time.monotonic``.
+    """
+
+    def __init__(
+        self,
+        calls_per_minute: int | None = None,
+        calls_per_second: float | None = None,
+        max_concurrency: int | None = None,
+        timeout: float = DEFAULT_TIMEOUT,
+    ):
         self.calls_per_minute = calls_per_minute
         self.calls_per_second = calls_per_second
         self.max_concurrency = max_concurrency
-        self._calls_min: DefaultDict[str, list[float]] = defaultdict(list)
-        self._calls_sec: DefaultDict[str, list[float]] = defaultdict(list)
-        self._semaphore: asyncio.Semaphore | None = None
+        self.timeout = timeout
+        self._calls_min: defaultdict[str, deque[float]] = defaultdict(deque)
+        self._calls_sec: defaultdict[str, deque[float]] = defaultdict(deque)
+        self._semaphore: asyncio.Semaphore | None = (
+            asyncio.Semaphore(max_concurrency) if max_concurrency is not None else None
+        )
         self._lock = asyncio.Lock()
 
+    async def __aenter__(self) -> "RateLimiter":
+        await self.acquire("")
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        self.release("")
+
     async def acquire(self, provider_name: str) -> None:
-        """Acquire a slot, blocking if rate limits would be exceeded."""
+        """Acquire a slot, waiting for quotas/concurrency as needed.
+
+        Raises ``asyncio.TimeoutError`` if a slot cannot be acquired within
+        ``self.timeout`` seconds.
+        """
+        await asyncio.wait_for(self._acquire(provider_name), timeout=self.timeout)
+
+    async def _acquire(self, provider_name: str) -> None:
+        semaphore = self._semaphore
+        if semaphore is not None:
+            await semaphore.acquire()
+        try:
+            while True:
+                wait_for = await self._wait_time(provider_name)
+                if wait_for <= 0:
+                    break
+                # Never sleep while holding the lock; re-check after waking.
+                await asyncio.sleep(wait_for)
+            await self._record(provider_name)
+        except BaseException:
+            if semaphore is not None:
+                semaphore.release()
+            raise
+
+    async def _wait_time(self, provider_name: str) -> float:
         async with self._lock:
-            if self.max_concurrency is not None:
-                if self._semaphore is None:
-                    self._semaphore = asyncio.Semaphore(self.max_concurrency)
-                await self._semaphore.acquire()
+            now = time.monotonic()
+            wait_for = 0.0
 
-            now = time.time()
-
-            # Enforce per-second limit
             if self.calls_per_second is not None:
                 bucket = self._calls_sec[provider_name]
-                # Remove timestamps older than 1 second
-                self._calls_sec[provider_name] = [t for t in bucket if now - t < 1.0]
-                if len(self._calls_sec[provider_name]) >= self.calls_per_second * 1.0:
-                    # Wait until a slot opens
-                    await asyncio.sleep(0.01)
-                    # Re-check after waiting
-                    await self.acquire(provider_name)
-                    return
+                while bucket and now - bucket[0] >= 1.0:
+                    bucket.popleft()
+                if self.calls_per_second > 0 and len(bucket) >= self.calls_per_second:
+                    wait_for = max(wait_for, 1.0 - (now - bucket[0]) + 1e-6)
 
-            # Enforce per-minute limit
             if self.calls_per_minute is not None:
                 bucket = self._calls_min[provider_name]
-                # Remove timestamps older than 60 seconds
-                self._calls_min[provider_name] = [t for t in bucket if now - t < 60.0]
-                if len(self._calls_min[provider_name]) >= self.calls_per_minute:
-                    # Calculate wait time
-                    oldest = min(self._calls_min[provider_name])
-                    wait_time = 60.0 - (now - oldest) + 0.01
-                    if wait_time > 0:
-                        await asyncio.sleep(wait_time)
-                    # Re-check after waiting
-                    await self.acquire(provider_name)
-                    return
+                while bucket and now - bucket[0] >= 60.0:
+                    bucket.popleft()
+                if self.calls_per_minute > 0 and len(bucket) >= self.calls_per_minute:
+                    wait_for = max(wait_for, 60.0 - (now - bucket[0]) + 1e-6)
+
+            return wait_for
+
+    async def _record(self, provider_name: str) -> None:
+        async with self._lock:
+            now = time.monotonic()
+            if self.calls_per_second is not None:
+                self._calls_sec[provider_name].append(now)
+            if self.calls_per_minute is not None:
+                self._calls_min[provider_name].append(now)
 
     def release(self, provider_name: str) -> None:
         """Release a concurrency slot."""
@@ -65,11 +106,10 @@ class RateLimiter:
             self._semaphore.release()
 
 
-# Global rate limiter instance - can be configured per provider
 _global_limiter: RateLimiter | None = None
 
 
-def set_global_limiter(limiter: RateLimiter) -> None:
+def set_global_limiter(limiter: RateLimiter | None) -> None:
     """Set the global rate limiter for all providers."""
     global _global_limiter
     _global_limiter = limiter
@@ -83,17 +123,12 @@ def get_global_limiter() -> RateLimiter | None:
 async def rate_limited_complete(
     provider,
     req,
-    rate_limiter: Optional[RateLimiter] = None,
-) -> any:
-    """Wrap provider.complete with rate limiting.
-
-    Should be called instead of provider.complete() directly when
-    rate limiting is configured.
-    """
+    rate_limiter: RateLimiter | None = None,
+) -> Any:
+    """Call ``provider.complete(req)`` once, under an optional rate limiter."""
     limiter = rate_limiter or _global_limiter
     if limiter is None:
         return await provider.complete(req)
-
     async with limiter:
         return await provider.complete(req)
 
@@ -102,12 +137,11 @@ async def rate_limited_embed(
     provider,
     texts: list[str],
     model: str,
-    rate_limiter: Optional[RateLimiter] = None,
-) -> any:
-    """Wrap provider.embed with rate limiting."""
+    rate_limiter: RateLimiter | None = None,
+) -> Any:
+    """Call ``provider.embed(texts, model)`` once, under an optional rate limiter."""
     limiter = rate_limiter or _global_limiter
     if limiter is None:
         return await provider.embed(texts, model)
-
     async with limiter:
         return await provider.embed(texts, model)

@@ -20,6 +20,7 @@ class AnthropicProvider:
             max_retries=0,
         )
         self._model_cache: list[str] | None = None
+        self._model_error: str | None = None
 
     @retry(
         wait=wait_exponential_jitter(initial=1, max=30),
@@ -110,19 +111,24 @@ class AnthropicProvider:
     async def list_models(self) -> list[str]:
         if self._model_cache is not None:
             return self._model_cache
-        self._model_cache = [
-            "claude-3-5-sonnet-20241022",
-            "claude-3-5-haiku-20241022",
-            "claude-3-opus-20240229",
-            "claude-3-sonnet-20240229",
-            "claude-3-haiku-20240307",
-        ]
-        return self._model_cache
+        try:
+            models = [model.id async for model in self.client.models.list()]
+            self._model_cache = models
+            return self._model_cache
+        except Exception as e:
+            self._model_error = str(e)
+            return []
 
-    async def health_check(self) -> bool:
+    async def health_check(self, model: str | None = None) -> bool:
+        if model is None:
+            models = await self.list_models()
+            if not models:
+                detail = f": {self._model_error}" if self._model_error else ""
+                raise RuntimeError(f"No models available for provider {self.name}{detail}")
+            model = models[0]
         try:
             await self.client.messages.create(
-                model="claude-3-5-haiku-20241022",
+                model=model,
                 messages=[{"role": "user", "content": "ping"}],
                 max_tokens=5,
             )

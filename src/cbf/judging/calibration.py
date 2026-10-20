@@ -8,6 +8,9 @@ import numpy as np
 
 from cbf.judging.panel import PairwiseResult, compute_elo
 
+MIN_JUDGES = 3
+MIN_ITEMS = 3
+
 
 def judge_severities(results: list[PairwiseResult]) -> dict[str, float]:
     """Severity per judge = (judge's mean item rating) - (panel grand mean).

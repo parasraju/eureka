@@ -6,7 +6,6 @@ from openai import AsyncOpenAI
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential_jitter
 
 from .base import LLMRequest, LLMResponse, ProviderConfig, generate_request_id
-from .rate_limiter import rate_limited_complete, rate_limited_embed, get_global_limiter, set_global_limiter
 
 
 class OpenAICompatibleProvider:
@@ -21,6 +20,7 @@ class OpenAICompatibleProvider:
             max_retries=0,
         )
         self._model_cache: list[str] | None = None
+        self._model_error: str | None = None
 
     @retry(
         wait=wait_exponential_jitter(initial=1, max=30),
@@ -45,14 +45,7 @@ class OpenAICompatibleProvider:
             kwargs["seed"] = req.seed
         kwargs.update(req.extra)
 
-        # Use rate-limited complete if global limiter is set
-        from .rate_limiter import rate_limited_complete as _rl_complete
-
-        response = await _rl_complete(
-            self,
-            req,
-            rate_limiter=get_global_limiter(),
-        )
+        response = await self.client.chat.completions.create(**kwargs)
 
         latency = time.perf_counter() - start
         choice = response.choices[0]
@@ -80,34 +73,27 @@ class OpenAICompatibleProvider:
         retry=retry_if_exception_type((httpx.TimeoutException, httpx.NetworkError, httpx.HTTPStatusError)),
     )
     async def embed(self, texts: list[str], model: str) -> list[list[float]]:
-        # Use rate-limited embed if global limiter is set
-        from .rate_limiter import rate_limited_embed as _rl_embed
+        response = await self.client.embeddings.create(model=model, input=texts)
+        return [item.embedding for item in response.data]
 
-        return await _rl_embed(
-            self,
-            texts,
-            model,
-            rate_limiter=get_global_limiter(),
-        )
+    def _model_rates(self, model: str) -> tuple[float, float, str | None]:
+        model = model.lower()
+        if "gpt-4o-mini" in model:
+            return 0.15 / 1_000_000, 0.60 / 1_000_000, None
+        if "gpt-4o" in model:
+            return 2.50 / 1_000_000, 10.00 / 1_000_000, None
+        if "gpt-4-turbo" in model or "gpt-4-1106" in model:
+            return 10.00 / 1_000_000, 30.00 / 1_000_000, None
+        if "gpt-3.5-turbo" in model:
+            return 0.50 / 1_000_000, 1.50 / 1_000_000, None
+        return 2.50 / 1_000_000, 10.00 / 1_000_000, "assumed-gpt-4o"
 
     def cost_usd(self, resp: LLMResponse) -> float:
-        model = resp.model.lower()
-        if "gpt-4o-mini" in model:
-            input_cost = 0.15 / 1_000_000
-            output_cost = 0.60 / 1_000_000
-        elif "gpt-4o" in model:
-            input_cost = 2.50 / 1_000_000
-            output_cost = 10.00 / 1_000_000
-        elif "gpt-4-turbo" in model or "gpt-4-1106" in model:
-            input_cost = 10.00 / 1_000_000
-            output_cost = 30.00 / 1_000_000
-        elif "gpt-3.5-turbo" in model:
-            input_cost = 0.50 / 1_000_000
-            output_cost = 1.50 / 1_000_000
-        else:
-            input_cost = 2.50 / 1_000_000
-            output_cost = 10.00 / 1_000_000
+        input_cost, output_cost, _ = self._model_rates(resp.model)
         return (resp.input_tokens * input_cost) + (resp.output_tokens * output_cost)
+
+    def cost_basis(self, resp: LLMResponse) -> str | None:
+        return self._model_rates(resp.model)[2]
 
     async def list_models(self) -> list[str]:
         if self._model_cache is not None:
@@ -116,18 +102,20 @@ class OpenAICompatibleProvider:
             models = await self.client.models.list()
             self._model_cache = [m.id for m in models.data]
             return self._model_cache
-        except Exception:
-            return [
-                "gpt-4o",
-                "gpt-4o-mini",
-                "gpt-4-turbo",
-                "gpt-3.5-turbo",
-            ]
+        except Exception as e:
+            self._model_error = str(e)
+            return []
 
-    async def health_check(self) -> bool:
+    async def health_check(self, model: str | None = None) -> bool:
+        if model is None:
+            models = await self.list_models()
+            if not models:
+                detail = f": {self._model_error}" if self._model_error else ""
+                raise RuntimeError(f"No models available for provider {self.name}{detail}")
+            model = models[0]
         try:
             await self.client.chat.completions.create(
-                model="gpt-4o-mini",
+                model=model,
                 messages=[{"role": "user", "content": "ping"}],
                 max_tokens=5,
             )

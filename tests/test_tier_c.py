@@ -1,11 +1,11 @@
-import sys
+from unittest import mock
 
-sys.path.insert(0, r'D:\p\eureka\src')
-
+import numpy as np
 import pytest
 
 from cbf.benchmarks.adapters import (
     AdapterApprovalError,
+    AdapterNotRunnable,
     RegistryAdapter,
     build_prompts_from_entry,
     load_adapter,
@@ -79,10 +79,35 @@ def test_associative_score():
         call_ids=[],
         metadata={},
     )
-    scores = bench.score(raw)
+
+    def fake_embed(texts, model_name):
+        return np.ones((len(texts), 8), dtype=float)
+
+    with mock.patch("cbf.metrics.embed_texts", side_effect=fake_embed):
+        scores = bench.score(raw)
     assert scores.metrics["chain_validity"] == 0.5
     assert scores.metrics["total_samples"] == 2
+    assert scores.metrics["connectivity"] == 1.0
+    assert scores.metadata["connectivity_method"] == "embedding-threshold"
     assert "chain_validity" in scores.confidence_intervals
+
+
+def test_associative_connectivity_unavailable():
+    bench = AssociativeBenchmark(AssociativeConfig(pairs=[("ocean", "algorithm")]))
+    from cbf.benchmarks.base import RawResults
+
+    raw = RawResults(
+        benchmark_id="associative",
+        model="test",
+        items=[make_assoc_result_items()[0]],
+        call_ids=[],
+        metadata={},
+    )
+
+    with mock.patch("cbf.metrics.embed_texts", side_effect=RuntimeError("model unavailable")):
+        scores = bench.score(raw)
+    assert scores.metrics["connectivity"] == 0.0
+    assert scores.metadata["connectivity_unavailable"] is True
 
 
 def test_associative_score_empty():
@@ -139,7 +164,10 @@ ENTRY_DICT = {
     "title": "Approved Creative Benchmark",
     "url": "https://example.com",
     "summary": "Evaluates divergent association in LLMs.",
-    "metadata": {"extracted": {"task_format": "open-ended generation"}},
+    "metadata": {
+        "extracted": {"task_format": "open-ended generation"},
+        "raw": {"prompts": ["Generate a novel metaphor for time."]},
+    },
     "relevance": 0.9,
     "runnability": 0.8,
     "credibility": 0.8,
@@ -167,8 +195,18 @@ def test_registry_adapter_prompts():
     entry = RegistryEntry(**ENTRY_DICT)
     adapter = RegistryAdapter(entry)
     prompts = adapter.prompts()
-    assert len(prompts) >= 1
+    assert len(prompts) == 1
+    assert prompts[0].prompt == "Generate a novel metaphor for time."
     assert adapter.id.startswith("adapter_approved-bench")
+
+
+def test_registry_adapter_requires_real_prompts():
+    entry = RegistryEntry(**ENTRY_DICT)
+    entry.metadata = {}
+    with pytest.raises(AdapterNotRunnable):
+        RegistryAdapter(entry)
+    with pytest.raises(AdapterNotRunnable, match="has no runnable prompts"):
+        build_prompts_from_entry(entry)
 
 
 def test_load_adapter_requires_approval():
@@ -200,11 +238,11 @@ def test_addapter_score_is_real():
     scores = adapter.score(raw)
     assert scores.metrics["completion_rate"] == pytest.approx(2 / 3)
     assert scores.metrics["n_outputs"] == 2
+    assert scores.metadata["proxy_metrics_only"] is True
 
 
-def test_build_prompts_no_source_fallback():
+def test_build_prompts_requires_source_prompts():
     entry = RegistryEntry(**ENTRY_DICT)
     entry.metadata = {}
-    prompts = build_prompts_from_entry(entry, fallback=["Extra prompt"])
-    assert len(prompts) == 2
-    assert prompts[1] == "Extra prompt"
+    with pytest.raises(AdapterNotRunnable):
+        build_prompts_from_entry(entry, fallback=["Extra prompt"])

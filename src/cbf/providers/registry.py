@@ -42,11 +42,11 @@ class ProviderRegistry:
     def list_names(self) -> list[str]:
         return list(self._providers.keys())
 
-    async def health_check_all(self) -> dict[str, bool]:
+    async def health_check_all(self, models: dict[str, str] | None = None) -> dict[str, bool]:
         results = {}
         for name, provider in self._providers.items():
             try:
-                results[name] = await provider.health_check()
+                results[name] = await provider.health_check((models or {}).get(name))
             except Exception:
                 results[name] = False
         return results

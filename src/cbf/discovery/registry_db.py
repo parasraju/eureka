@@ -2,6 +2,8 @@
 
 Status workflow (plan section 3.2):
     seed -> candidate -> adapter_drafted -> approved -> rejected(reason)
+Any non-approved status may move to rejected. Rejecting an approved entry
+requires a non-empty reason. Illegal transitions raise ValueError.
 Only 'approved' entries may run on a published leaderboard (human approval gate).
 """
 
@@ -12,6 +14,24 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 VALID_STATUSES = ("seed", "candidate", "adapter_drafted", "approved", "rejected")
+
+ALLOWED_TRANSITIONS: dict[str, set[str]] = {
+    "seed": {"candidate", "rejected"},
+    "candidate": {"adapter_drafted", "rejected"},
+    "adapter_drafted": {"approved", "rejected"},
+    "approved": {"rejected"},
+    "rejected": set(),
+}
+
+
+def _parse_iso(value: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return datetime.min.replace(tzinfo=UTC)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS benchmarks (
@@ -152,12 +172,25 @@ class RegistryDB:
     def set_status(self, entry_id: str, status: str, reason: str = "") -> None:
         if status not in VALID_STATUSES:
             raise ValueError(f"Invalid status {status!r}. Valid: {VALID_STATUSES}")
-        cur = self.conn.execute(
+
+        row = self.conn.execute(
+            "SELECT status FROM benchmarks WHERE id = ?", (entry_id,)
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"No benchmark with id {entry_id!r}")
+
+        current = row["status"]
+        if status != current and status not in ALLOWED_TRANSITIONS.get(current, set()):
+            raise ValueError(
+                f"Illegal status transition {current!r} -> {status!r} for {entry_id!r}"
+            )
+        if current == "approved" and status == "rejected" and not reason.strip():
+            raise ValueError("Rejecting an approved benchmark requires a non-empty reason")
+
+        self.conn.execute(
             "UPDATE benchmarks SET status = ?, status_reason = ? WHERE id = ?",
             (status, reason, entry_id),
         )
-        if cur.rowcount == 0:
-            raise KeyError(f"No benchmark with id {entry_id!r}")
         self.conn.commit()
 
     def set_adapter(self, entry_id: str, adapter_path: str) -> None:
@@ -171,16 +204,18 @@ class RegistryDB:
         return self.search(status="approved")
 
     def new_since(self, days: int) -> list[RegistryEntry]:
-        cutoff = (datetime.now(UTC) - timedelta(days=days)).isoformat()
+        cutoff = datetime.now(UTC) - timedelta(days=days)
         rows = self.conn.execute(
-            "SELECT * FROM benchmarks WHERE first_seen >= ? ORDER BY score DESC", (cutoff,)
+            "SELECT * FROM benchmarks ORDER BY score DESC"
         ).fetchall()
-        return [self._to_entry(r) for r in rows]
+        entries = [self._to_entry(r) for r in rows]
+        return [entry for entry in entries if _parse_iso(entry.first_seen) >= cutoff]
 
     def digest(self, days: int = 7) -> str:
         """Markdown 'what's new' digest for the last N days."""
+        cutoff = datetime.now(UTC) - timedelta(days=days)
         entries = self.new_since(days)
-        approved = [e for e in self.approved() if e.first_seen >= (datetime.now(UTC) - timedelta(days=days)).isoformat()]
+        approved = [e for e in self.approved() if _parse_iso(e.first_seen) >= cutoff]
         lines = [
             f"# Benchmark discovery digest (last {days} days)",
             "",

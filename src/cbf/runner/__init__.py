@@ -1,6 +1,7 @@
 import hashlib
+import json
 import uuid
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import UTC, datetime
 from itertools import product
 from pathlib import Path
@@ -9,7 +10,7 @@ import yaml
 
 from cbf.benchmarks import TIER_A, get_benchmark, list_benchmarks
 from cbf.providers import ProviderRegistry, build_registry_from_settings, parse_model_spec
-from cbf.storage import BudgetGuard, CallLogger
+from cbf.storage import BudgetExceededError, BudgetGuard, CallLogger
 
 
 def expand_conditions(conditions: dict) -> dict:
@@ -42,6 +43,13 @@ def expand_conditions(conditions: dict) -> dict:
     return cells
 
 
+def _suite_benchmarks(suite: str) -> list[str]:
+    if suite == "tier_a":
+        return list(TIER_A)
+    available = list_benchmarks()
+    return [name.strip() for name in suite.split(",") if name.strip() in available]
+
+
 class _LoggingProvider:
     """Wraps a provider so every completion is persisted to the run call log."""
 
@@ -55,14 +63,47 @@ class _LoggingProvider:
         return getattr(self._provider, item)
 
     async def complete(self, req):
-        resp = await self._provider.complete(req)
+        if self._budget is not None and self._budget.remaining() <= 0:
+            raise BudgetExceededError(
+                f"Budget exhausted: spent ${self._budget.get_spent():.6f} of ${self._budget.max_usd:.6f}"
+            )
+
+        try:
+            from cbf.providers.rate_limiter import get_global_limiter, rate_limited_complete
+
+            resp = await rate_limited_complete(self._provider, req, get_global_limiter())
+        except Exception as e:
+            self._logger.log_call(
+                provider=self.name,
+                model=req.model,
+                request=asdict(req),
+                response=None,
+                latency_s=0.0,
+                cost_usd=0.0,
+                error=str(e),
+            )
+            raise
+
         try:
             cost = float(self._provider.cost_usd(resp))
         except Exception:
             cost = 0.0
+
+        cost_basis = None
+        basis_fn = getattr(self._provider, "cost_basis", None)
+        if callable(basis_fn):
+            try:
+                cost_basis = basis_fn(resp)
+            except Exception:
+                cost_basis = None
+
+        within_budget = True
         if self._budget is not None:
-            self._budget.check_and_add(cost)
-        self._logger.log_call(
+            within_budget = self._budget.check_and_add(cost)
+            if not within_budget:
+                self._budget.add_spend(cost)
+
+        call_id = self._logger.log_call(
             provider=self.name,
             model=req.model,
             request=asdict(req),
@@ -71,8 +112,15 @@ class _LoggingProvider:
             cost_usd=cost,
             input_tokens=resp.input_tokens,
             output_tokens=resp.output_tokens,
+            cost_basis=cost_basis,
         )
-        return resp
+
+        if not within_budget:
+            raise BudgetExceededError(
+                f"Budget exceeded: spent ${self._budget.get_spent():.6f} of ${self._budget.max_usd:.6f}"
+            )
+
+        return replace(resp, request_id=call_id)
 
 
 class BenchmarkRunner:
@@ -102,6 +150,7 @@ class BenchmarkRunner:
             provider_versions={provider_name: "1.0"},
             config_hash=self._hash_config(),
             embedding_model=self.config.get("embeddings", {}).get("model", "sentence-transformers/all-MiniLM-L6-v2"),
+            result_file="results.jsonl",
         )
 
         return provider, model_name
@@ -119,6 +168,41 @@ class BenchmarkRunner:
         if self.logger is None:
             return provider
         return _LoggingProvider(provider, self.logger, self.budget)
+
+    def write_result(self, benchmark_name: str, condition_name: str, model: str, raw_results, scores):
+        if self.logger is not None:
+            run_dir = self.logger.run_dir
+            result_file = self.logger.get_manifest().result_file
+        elif self.run_id is not None:
+            run_dir = self.runs_dir / self.run_id
+            run_dir.mkdir(parents=True, exist_ok=True)
+            result_file = "results.jsonl"
+        else:
+            return
+
+        entry = {
+            "benchmark": benchmark_name,
+            "condition": condition_name,
+            "model": model,
+            "raw": {
+                "benchmark_id": raw_results.benchmark_id,
+                "model": raw_results.model,
+                "items": raw_results.items,
+                "call_ids": raw_results.call_ids,
+                "metadata": raw_results.metadata,
+            },
+            "scores": {
+                "benchmark_id": scores.benchmark_id,
+                "model": scores.model,
+                "metrics": scores.metrics,
+                "confidence_intervals": scores.confidence_intervals,
+                "metadata": scores.metadata,
+            },
+        }
+
+        with open(run_dir / result_file, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")
+            f.flush()
 
     async def run_benchmark(self, provider, model: str, benchmark_name: str, conditions: dict) -> dict:
         bench = get_benchmark(benchmark_name)
@@ -142,6 +226,7 @@ class BenchmarkRunner:
                 await judge_fn(raw_results, run_cfg, self._resolve_logged_provider)
 
             scores = bench.score(raw_results)
+            self.write_result(benchmark_name, condition_name, model, raw_results, scores)
 
             all_results[condition_name] = {
                 "raw": raw_results,
@@ -187,33 +272,69 @@ async def run_benchmarks(
         runner.logger.update_manifest(
             models=[model_spec],
             config_hash=runner._hash_config(),
+            embedding_model=config.get("embeddings", {}).get("model", "sentence-transformers/all-MiniLM-L6-v2"),
+            result_file="results.jsonl",
         )
+
+        est = None
+        try:
+            from cbf.runner.estimate import estimate_run_cost
+
+            dry_conditions = conditions if conditions is not None else config.get("conditions", {})
+            est = estimate_run_cost(
+                model_spec=model_spec,
+                suite=suite,
+                conditions=dry_conditions,
+                config=config,
+            )
+        except Exception:
+            est = None
+
         runner.finalize(status="dry_run")
-        return {"run_id": run_id, "status": "dry_run", "estimated_cost": 0.0}
+        return {"run_id": run_id, "status": "dry_run", "estimated_cost": est}
 
     provider, model = await runner.initialize(model_spec, max_usd)
-    if runner.logger is not None:
-        runner.logger.update_manifest(suite=suite)
 
-    if conditions is None:
-        conditions = config.get("conditions", {})
-        if not conditions:
-            conditions = {
-                "neutral": {"condition": "neutral", "temperature": 0.7, "num_samples": 10},
-                "creative": {"condition": "creative", "temperature": 0.7, "num_samples": 10},
-            }
-    conditions = expand_conditions(conditions)
+    try:
+        if runner.logger is not None:
+            runner.logger.update_manifest(suite=suite)
 
-    if suite == "tier_a":
-        results = await runner.run_tier_a(provider, model, conditions)
-    else:
-        results = {}
-        for bench_name in suite.split(","):
-            bench_name = bench_name.strip()
-            if bench_name in list_benchmarks():
-                results[bench_name] = await runner.run_benchmark(provider, model, bench_name, conditions)
+        if conditions is None:
+            conditions = config.get("conditions", {})
+            if not conditions:
+                conditions = {
+                    "neutral": {"condition": "neutral", "temperature": 0.7, "num_samples": 10},
+                    "creative": {"condition": "creative", "temperature": 0.7, "num_samples": 10},
+                }
+        conditions = expand_conditions(conditions)
 
-    runner.finalize(status="completed")
+        prompt_set_hashes = {}
+        for bench_name in _suite_benchmarks(suite):
+            bench = get_benchmark(bench_name)
+            prompt_text = "\n".join(p.prompt for p in bench.prompts())
+            prompt_set_hashes[bench_name] = hashlib.sha256(prompt_text.encode()).hexdigest()
+
+        if runner.logger is not None:
+            runner.logger.update_manifest(
+                prompt_set_hashes=prompt_set_hashes,
+                conditions=list(conditions.keys()),
+                embedding_model=config.get("embeddings", {}).get("model", "sentence-transformers/all-MiniLM-L6-v2"),
+            )
+
+        if suite == "tier_a":
+            results = await runner.run_tier_a(provider, model, conditions)
+        else:
+            results = {}
+            for bench_name in suite.split(","):
+                bench_name = bench_name.strip()
+                if bench_name in list_benchmarks():
+                    results[bench_name] = await runner.run_benchmark(provider, model, bench_name, conditions)
+
+        runner.finalize(status="completed")
+    except Exception as e:
+        runner.finalize(status="failed", error=str(e))
+        raise
+
     return {"run_id": runner.run_id, "results": results}
 
 

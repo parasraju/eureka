@@ -7,6 +7,7 @@ from .compare import (
     render_profiles_markdown,
 )
 from .generator import (
+    collect_texts_by_model,
     compute_scores_from_run,
     generate_html_report,
     generate_json_report,
@@ -19,6 +20,7 @@ from .generator import (
 
 __all__ = [
     "load_run_results",
+    "collect_texts_by_model",
     "compute_scores_from_run",
     "generate_leaderboard",
     "generate_markdown_report",

@@ -1,7 +1,6 @@
 import numpy as np
-from sklearn.metrics.pairwise import cosine_distances
 from sentence_transformers import SentenceTransformer
-
+from sklearn.metrics.pairwise import cosine_distances
 
 _embed_model: SentenceTransformer | None = None
 _embed_model_name: str = ""

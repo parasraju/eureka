@@ -1,7 +1,3 @@
-import sys
-
-sys.path.insert(0, r'D:\p\eureka\src')
-
 import numpy as np
 
 from cbf.metrics import (

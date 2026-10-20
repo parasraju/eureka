@@ -101,3 +101,60 @@ def test_parse_model_spec():
 
     with pytest.raises(ValueError):
         parse_model_spec("gpt-4o")
+
+
+def test_estimate_run_cost_deterministic():
+    from cbf.runner.estimate import estimate_run_cost
+
+    config = {"benchmarks": {}, "conditions": {}}
+    conditions = {"cell": {"condition": "neutral", "num_samples": 2}}
+    first = estimate_run_cost(config, "tier_a", conditions, "openai:gpt-4o")
+    second = estimate_run_cost(config, "tier_a", conditions, "openai:gpt-4o")
+
+    assert first == second
+    assert first["calls"] == 2 + 20 + 50
+    assert first["total_usd"] > 0
+    assert set(first["breakdown"]) == {"dat", "aut", "diversity"}
+    assert all(entry["calls"] > 0 for entry in first["breakdown"].values())
+    assert first["assumptions"]
+
+
+def test_human_norms_missing_and_malformed(tmp_path):
+    from cbf.metrics.human_norms import HumanNormUnavailable, load_norm, percentile
+
+    with pytest.raises(HumanNormUnavailable, match="No human-norm baseline"):
+        percentile(50.0, "dat", tmp_path)
+
+    (tmp_path / "bad.json").write_text("{not json", encoding="utf-8")
+    with pytest.raises(HumanNormUnavailable, match="Could not read"):
+        load_norm("bad", tmp_path)
+
+    (tmp_path / "incomplete.json").write_text('{"instrument": "incomplete"}', encoding="utf-8")
+    with pytest.raises(HumanNormUnavailable, match="missing required key"):
+        load_norm("incomplete", tmp_path)
+
+    (tmp_path / "zerosd.json").write_text(
+        '{"instrument": "zerosd", "source_url": "https://example.org", '
+        '"license": "CC-BY-4.0", "retrieval_date": "2026-01-01", "n": 10, '
+        '"mean": 50, "sd": 0}',
+        encoding="utf-8",
+    )
+    with pytest.raises(HumanNormUnavailable, match="non-positive sd"):
+        load_norm("zerosd", tmp_path)
+
+
+def test_human_norms_percentile_from_sourced_file(tmp_path):
+    from cbf.metrics.human_norms import percentile
+
+    (tmp_path / "dat.json").write_text(
+        '{"instrument": "dat", "source_url": "https://example.org/norms", '
+        '"license": "CC-BY-4.0", "retrieval_date": "2026-01-01", "n": 120, '
+        '"mean": 70, "sd": 10, "higher_is_better": true}',
+        encoding="utf-8",
+    )
+
+    assert percentile(70, "dat", tmp_path) == pytest.approx(50.0)
+    assert percentile(80, "dat", tmp_path) == pytest.approx(84.134, abs=0.01)
+    assert percentile(-1000, "dat", tmp_path) == 0.0
+    assert percentile(1000, "dat", tmp_path) == 100.0
+    assert percentile(80, "dat", tmp_path, higher_is_better=False) == pytest.approx(15.866, abs=0.01)

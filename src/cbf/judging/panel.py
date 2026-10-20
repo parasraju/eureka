@@ -1,5 +1,6 @@
 import asyncio
-import re
+import random
+import string
 from dataclasses import asdict, dataclass, field
 
 import krippendorff
@@ -9,31 +10,33 @@ from scipy import stats
 from cbf.benchmarks import BenchmarkItem, RawResults, Scores
 from cbf.providers import LLMProvider, LLMRequest
 
-_WINNER_RE = re.compile(r"\b(A|B|TIE)\b")
-_WINNER_RE_CI = re.compile(r"\b(A|B|TIE)\b", re.IGNORECASE)
-_LEADING_WINNER_RE = re.compile(r"^[^A-Za-z0-9]*(A|B|TIE)\b", re.IGNORECASE)
+_PUNCTUATION = string.punctuation + "“”‘’«»–—•"
+_MARKDOWN_PREFIX = "*_`~#>•–— \t"
+_VALID_WINNERS = {"a": "a", "b": "b", "tie": "tie"}
+
+
+def _first_token(line: str) -> str:
+    cleaned = line.strip().lstrip(_MARKDOWN_PREFIX).strip()
+    if not cleaned:
+        return ""
+    token = cleaned.split()[0]
+    token = token.strip(_PUNCTUATION + " \t")
+    return token.strip("*_`~")
 
 
 def parse_winner(text: str) -> str:
-    """Extract a decision from a judge response as "a", "b", or "tie".
+    """Extract a strict decision from a judge response.
 
-    Tries, in order: a leading token in the first line, then an uppercase
-    standalone token (judges are told to answer with ONLY A/B/TIE), then a
-    case-insensitive standalone token. Undecidable responses are ties.
+    Only the first non-empty line is considered. After stripping markdown,
+    quotes, and surrounding punctuation, its first token must be exactly
+    ``A``, ``B``, or ``TIE`` (case-insensitive). Anything else is ``"invalid"``.
     """
     if not text or not text.strip():
-        return "tie"
-    stripped = text.strip()
-    first_line = stripped.splitlines()[0]
+        return "invalid"
 
-    match = _LEADING_WINNER_RE.search(first_line)
-    if not match:
-        match = _WINNER_RE.search(first_line) or _WINNER_RE.search(stripped)
-    if not match:
-        match = _WINNER_RE_CI.search(first_line) or _WINNER_RE_CI.search(stripped)
-    if not match:
-        return "tie"
-    return {"A": "a", "B": "b", "TIE": "tie"}[match.group(1).upper()]
+    first_line = next((line for line in text.splitlines() if line.strip()), "")
+    token = _first_token(first_line)
+    return _VALID_WINNERS.get(token.lower(), "invalid")
 
 
 @dataclass
@@ -46,13 +49,14 @@ class JudgeConfig:
     max_tokens: int = 1000
     rubric: str = ""
     swap_position: bool = True
+    max_pairs: int = 200
 
 
 @dataclass
 class PairwiseResult:
     item_a_id: str
     item_b_id: str
-    winner: str  # "a", "b", or "tie"
+    winner: str  # "a", "b", "tie", or "invalid"
     judge: str
     position_swapped: bool
     reasoning: str = ""
@@ -77,6 +81,7 @@ def build_judge_config(raw) -> JudgeConfig:
             max_tokens=int(raw.get("max_tokens", 1000)),
             rubric=raw.get("rubric", "") or "",
             swap_position=bool(raw.get("swap_position", True)),
+            max_pairs=int(raw.get("max_pairs", 200)),
         )
     return JudgeConfig(judge_models=[])
 
@@ -91,6 +96,30 @@ def is_self_judge(judge_spec: str, model_under_test: str) -> bool:
     return judge_model_name(judge_spec) == judge_model_name(model_under_test)
 
 
+def _item_model(item_id: str) -> str | None:
+    return item_id.split("::", 1)[0] if "::" in item_id else None
+
+
+def _is_cross_model_pair(result: PairwiseResult) -> bool:
+    model_a = _item_model(result.item_a_id)
+    model_b = _item_model(result.item_b_id)
+    return model_a is not None and model_b is not None and model_a != model_b
+
+
+def _model_of_item_from_ids(results: list[PairwiseResult]) -> dict[str, str]:
+    mapping: dict[str, str] = {}
+    for result in results:
+        for item_id in (result.item_a_id, result.item_b_id):
+            model = _item_model(item_id)
+            if model is not None:
+                mapping[item_id] = model
+    return mapping
+
+
+def _raw_item_id(item: dict) -> str:
+    return f"p{item.get('prompt_idx', 0)}_g{item.get('generation_idx', 0)}"
+
+
 class JudgePanel:
     def __init__(self, config: JudgeConfig, provider_registry=None, providers: dict | None = None):
         self.config = config
@@ -103,7 +132,7 @@ class JudgePanel:
         if self.provider_registry is None:
             raise ValueError("JudgePanel requires a provider_registry or explicit providers")
         for model_spec in self.config.judge_models:
-            provider_name, model_name = model_spec.split(":", 1)
+            provider_name = model_spec.split(":", 1)[0]
             provider = self.provider_registry.get(provider_name)
             if not provider:
                 raise ValueError(f"Judge provider {provider_name} not configured")
@@ -157,7 +186,7 @@ Then provide a brief reasoning (1-2 sentences)."""
         resp = await provider.complete(req)
 
         winner = parse_winner(resp.text)
-        if swap and winner != "tie":
+        if swap and winner in {"a", "b"}:
             winner = "b" if winner == "a" else "a"
 
         return PairwiseResult(
@@ -170,53 +199,100 @@ Then provide a brief reasoning (1-2 sentences)."""
             raw_response=resp.text,
         )
 
-    async def judge_all_pairs(
+    async def _judge_ordered_pairs(
         self,
         texts: dict[str, str],
-        item_ids: list[str] | None = None,
+        pairs: list[tuple[str, str]],
     ) -> list[PairwiseResult]:
-        if item_ids is None:
-            item_ids = list(texts.keys())
-
-        results = []
-        pairs = []
-        for i in range(len(item_ids)):
-            for j in range(i + 1, len(item_ids)):
-                pairs.append((item_ids[i], item_ids[j]))
-
+        results: list[PairwiseResult] = []
         for judge_model in self.config.judge_models:
             for item_a_id, item_b_id in pairs:
-                # First judgment (original position)
-                result1 = await self.judge_pair(
+                results.append(await self.judge_pair(
                     judge_model,
                     texts[item_a_id],
                     texts[item_b_id],
                     item_a_id,
                     item_b_id,
                     swap=False,
-                )
-                results.append(result1)
-
-                # Second judgment (swapped position) if enabled
+                ))
                 if self.config.swap_position:
-                    result2 = await self.judge_pair(
+                    results.append(await self.judge_pair(
                         judge_model,
                         texts[item_a_id],
                         texts[item_b_id],
                         item_a_id,
                         item_b_id,
                         swap=True,
-                    )
-                    results.append(result2)
-
+                    ))
         return results
+
+    async def judge_all_pairs(
+        self,
+        texts: dict[str, str],
+        item_ids: list[str] | None = None,
+        max_pairs: int | None = None,
+    ) -> list[PairwiseResult]:
+        if item_ids is None:
+            item_ids = list(texts.keys())
+
+        pairs = [
+            (item_ids[i], item_ids[j])
+            for i in range(len(item_ids))
+            for j in range(i + 1, len(item_ids))
+        ]
+
+        cap = self.config.max_pairs if max_pairs is None else int(max_pairs)
+        if cap < 0:
+            raise ValueError("max_pairs must be non-negative")
+        if len(pairs) > cap:
+            raise ValueError(
+                f"Refusing to judge {len(pairs)} pairs: max_pairs is {cap}. "
+                "Increase JudgeConfig.max_pairs or reduce the item set."
+            )
+
+        return await self._judge_ordered_pairs(texts, pairs)
+
+    async def judge_models_pairwise(
+        self,
+        texts_by_model: dict[str, list[str]],
+        max_pairs: int = 200,
+    ) -> list[PairwiseResult]:
+        """Judge deterministically sampled pairs that span different models.
+
+        Item ids are ``"<model>::<idx>"``. At most ``max_pairs`` cross-model
+        item pairs are judged (also capped by ``JudgeConfig.max_pairs``).
+        """
+        texts: dict[str, str] = {}
+        for model in sorted(texts_by_model):
+            for idx, text in enumerate(texts_by_model[model]):
+                texts[f"{model}::{idx}"] = text
+
+        models = sorted(texts_by_model)
+        pairs: list[tuple[str, str]] = []
+        for i in range(len(models)):
+            for j in range(i + 1, len(models)):
+                model_a, model_b = models[i], models[j]
+                for idx_a in range(len(texts_by_model[model_a])):
+                    for idx_b in range(len(texts_by_model[model_b])):
+                        pairs.append((f"{model_a}::{idx_a}", f"{model_b}::{idx_b}"))
+
+        cap = min(int(max_pairs), int(self.config.max_pairs))
+        if cap < 0:
+            raise ValueError("max_pairs must be non-negative")
+        if len(pairs) > cap:
+            rng = random.Random(0)
+            chosen = sorted(rng.sample(range(len(pairs)), cap))
+            pairs = [pairs[i] for i in chosen]
+
+        return await self._judge_ordered_pairs(texts, pairs)
 
 
 def resolve_pairs(results: list[PairwiseResult]) -> list[PairwiseResult]:
     """Collapse repeated judgments of the same pair (e.g. position swaps) into one.
 
-    Agreement across orders -> that winner; any disagreement -> a tie; a single
-    decided judgment among ties -> that winner. Returns results in first-seen order.
+    Invalid judgments are ignored. Agreement across orders -> that winner; any
+    disagreement -> a tie; a single decided judgment among ties -> that winner.
+    A pair with only invalid judgments resolves to ``"invalid"``.
     """
     groups: dict[tuple, list[PairwiseResult]] = {}
     order: list[tuple] = []
@@ -231,19 +307,23 @@ def resolve_pairs(results: list[PairwiseResult]) -> list[PairwiseResult]:
     for key in order:
         group = groups[key]
         a_id, b_id = key[0]
+        valid = [r for r in group if r.winner != "invalid"]
         decided = set()
-        for r in group:
+        for r in valid:
             if r.winner == "a":
                 decided.add(a_id)
             elif r.winner == "b":
                 decided.add(b_id)
-        if len(decided) == 1:
-            winner_id = next(iter(decided))
-        else:
-            winner_id = None
 
-        winner = "a" if winner_id == a_id else "b" if winner_id == b_id else "tie"
-        base = group[0]
+        if not valid:
+            winner = "invalid"
+        elif len(decided) == 1:
+            winner_id = next(iter(decided))
+            winner = "a" if winner_id == a_id else "b"
+        else:
+            winner = "tie"
+
+        base = valid[0] if valid else group[0]
         resolved.append(PairwiseResult(
             item_a_id=a_id,
             item_b_id=b_id,
@@ -269,6 +349,8 @@ def compute_elo(
     ratings = dict.fromkeys(items, initial_rating)
 
     for result in resolve_pairs(results):
+        if result.winner == "invalid":
+            continue
         a_id, b_id = result.item_a_id, result.item_b_id
         r_a, r_b = ratings[a_id], ratings[b_id]
 
@@ -304,6 +386,8 @@ def compute_bradley_terry(
 
     wins = np.zeros((n, n))
     for r in resolve_pairs(results):
+        if r.winner == "invalid":
+            continue
         i = item_to_idx[r.item_a_id]
         j = item_to_idx[r.item_b_id]
         if r.winner == "a":
@@ -311,7 +395,6 @@ def compute_bradley_terry(
         elif r.winner == "b":
             wins[j, i] += 1
         else:
-            # Ties count as half a win to each side (Davidson-style smoothing).
             wins[i, j] += 0.5
             wins[j, i] += 0.5
 
@@ -338,21 +421,124 @@ def compute_bradley_terry(
     return {item_list[i]: float(params[i]) for i in range(n)}
 
 
+def compute_model_matches(results: list[PairwiseResult]) -> dict[str, dict[str, int]]:
+    """Per-model wins/losses/ties from cross-model pairs (item ids encode models)."""
+    matches: dict[str, dict[str, int]] = {}
+    for result in results:
+        model_a = _item_model(result.item_a_id)
+        model_b = _item_model(result.item_b_id)
+        if model_a is None or model_b is None or model_a == model_b:
+            continue
+        for model in (model_a, model_b):
+            matches.setdefault(model, {"wins": 0, "losses": 0, "ties": 0})
+        if result.winner == "a":
+            matches[model_a]["wins"] += 1
+            matches[model_b]["losses"] += 1
+        elif result.winner == "b":
+            matches[model_b]["wins"] += 1
+            matches[model_a]["losses"] += 1
+        elif result.winner == "tie":
+            matches[model_a]["ties"] += 1
+            matches[model_b]["ties"] += 1
+    return matches
+
+
+def compute_model_ratings(
+    results: list[PairwiseResult],
+    model_of_item: dict[str, str],
+) -> dict[str, dict[str, float]]:
+    """Elo/BT/win-rate ratings for models, using cross-model pairs only.
+
+    Ties count as half a win in ``win_rate``. Invalid judgments are excluded
+    from ratings and reported via ``invalid_rate``.
+    """
+    mapping = dict(model_of_item)
+
+    def model_for(item_id: str) -> str | None:
+        return mapping.get(item_id) or _item_model(item_id)
+
+    cross: list[PairwiseResult] = []
+    for result in results:
+        model_a = model_for(result.item_a_id)
+        model_b = model_for(result.item_b_id)
+        if model_a is None or model_b is None or model_a == model_b:
+            continue
+        mapping.setdefault(result.item_a_id, model_a)
+        mapping.setdefault(result.item_b_id, model_b)
+        cross.append(result)
+
+    matches: dict[str, dict[str, int]] = {}
+    for result in cross:
+        model_a = mapping[result.item_a_id]
+        model_b = mapping[result.item_b_id]
+        for model in (model_a, model_b):
+            matches.setdefault(model, {"wins": 0, "losses": 0, "ties": 0})
+        if result.winner == "a":
+            matches[model_a]["wins"] += 1
+            matches[model_b]["losses"] += 1
+        elif result.winner == "b":
+            matches[model_b]["wins"] += 1
+            matches[model_a]["losses"] += 1
+        elif result.winner == "tie":
+            matches[model_a]["ties"] += 1
+            matches[model_b]["ties"] += 1
+
+    win_rate: dict[str, float] = {}
+    for model, record in matches.items():
+        games = record["wins"] + record["losses"] + record["ties"]
+        win_rate[model] = (
+            (record["wins"] + 0.5 * record["ties"]) / games if games else 0.0
+        )
+
+    model_results: list[PairwiseResult] = []
+    for index, result in enumerate(cross):
+        if result.winner == "invalid":
+            continue
+        model_results.append(PairwiseResult(
+            item_a_id=mapping[result.item_a_id],
+            item_b_id=mapping[result.item_b_id],
+            winner=result.winner,
+            judge=f"{result.judge}::{index}",
+            position_swapped=result.position_swapped,
+            reasoning=result.reasoning,
+            raw_response=result.raw_response,
+        ))
+
+    elo = compute_elo(model_results) if model_results else {}
+    bt = compute_bradley_terry(model_results) if model_results else {}
+    invalid = sum(1 for r in cross if r.winner == "invalid")
+    invalid_rate = invalid / len(cross) if cross else 0.0
+
+    return {
+        "elo": elo,
+        "bt": bt,
+        "win_rate": win_rate,
+        "invalid_rate": invalid_rate,
+    }
+
+
 def compute_inter_judge_agreement(results: list[PairwiseResult]) -> dict:
     judges = sorted({r.judge for r in results})
     item_list = sorted({r.item_a_id for r in results} | {r.item_b_id for r in results})
+    invalid_rate = (
+        sum(1 for r in results if r.winner == "invalid") / len(results)
+        if results else 0.0
+    )
     if len(judges) < 2:
         return {
             "krippendorff_alpha": 0.0,
             "mean_spearman": 0.0,
             "num_judges": len(judges),
             "num_items": len(item_list),
+            "invalid_rate": invalid_rate,
         }
 
     judge_ratings: dict[str, dict[str, float]] = {}
     rated_items: set[str] = set()
     for judge in judges:
-        ratings = compute_elo([r for r in results if r.judge == judge])
+        ratings = compute_elo([
+            r for r in results if r.judge == judge and r.winner != "invalid"
+        ])
         judge_ratings[judge] = ratings
         rated_items |= set(ratings)
     item_list = sorted(rated_items)
@@ -381,6 +567,7 @@ def compute_inter_judge_agreement(results: list[PairwiseResult]) -> dict:
         "mean_spearman": float(np.mean(spearman_corrs)) if spearman_corrs else 0.0,
         "num_judges": len(judges),
         "num_items": len(item_list),
+        "invalid_rate": invalid_rate,
     }
 
 
@@ -498,18 +685,23 @@ class WritingEloBenchmark:
         for item in raw.items:
             if "error" in item:
                 continue
-            item_id = f"p{item.get('prompt_idx', 0)}_g{item.get('generation_idx', 0)}"
-            texts[item_id] = item.get("text", "")
+            texts[_raw_item_id(item)] = item.get("text", "")
 
         pairwise: list[PairwiseResult] = []
+        pairs_judged = len(texts) * (len(texts) - 1) // 2
         if len(texts) >= 2:
             pairwise = await panel.judge_all_pairs(texts, list(texts.keys()))
 
         raw.metadata["pairwise"] = [asdict(p) for p in pairwise]
+        raw.metadata["pairs_judged"] = pairs_judged
+        raw.metadata["judge_calls"] = len(pairwise)
         raw.metadata["judge"] = {
             "models": selected,
             "filtered_self_judges": filtered,
             "swap_position": judge_config.swap_position,
+            "max_pairs": judge_config.max_pairs,
+            "pairs_judged": pairs_judged,
+            "judge_calls": len(pairwise),
         }
 
     def score(self, raw: RawResults) -> Scores:
@@ -527,6 +719,10 @@ class WritingEloBenchmark:
                 benchmark_id=self.id,
                 model=raw.model,
                 metrics={"elo_rating": 0.0, "agreement": 0.0},
+                metadata={"calibration": {
+                    "available": False,
+                    "reason": "no generation items to judge",
+                }},
             )
 
         metrics: dict[str, float] = {
@@ -538,14 +734,113 @@ class WritingEloBenchmark:
             metadata["judge"] = raw.metadata["judge"]
 
         pairwise = [PairwiseResult(**p) for p in raw.metadata.get("pairwise", [])]
-        if pairwise:
-            elo = compute_elo(pairwise)
-            bt = compute_bradley_terry(pairwise)
-            agreement = compute_inter_judge_agreement(pairwise)
-            metrics["elo_rating"] = float(np.mean(list(elo.values()))) if elo else 0.0
+        cross_raw = raw.metadata.get("cross_model_pairwise", [])
+        cross_pairwise = [
+            p if isinstance(p, PairwiseResult) else PairwiseResult(**p)
+            for p in cross_raw
+        ]
+
+        model_of_item = dict(raw.metadata.get("model_of_item") or {})
+        if cross_pairwise:
+            if not model_of_item:
+                model_of_item = _model_of_item_from_ids(cross_pairwise)
+            intra_pairwise = pairwise
+        elif any(_is_cross_model_pair(r) for r in pairwise):
+            cross_pairwise = pairwise
+            if not model_of_item:
+                model_of_item = _model_of_item_from_ids(pairwise)
+            intra_pairwise = [r for r in pairwise if not _is_cross_model_pair(r)]
+        else:
+            intra_pairwise = pairwise
+
+        if pairwise or cross_pairwise:
+            metrics.setdefault("elo_rating", 0.0)
+        if intra_pairwise:
+            elo = compute_elo(intra_pairwise)
+            bt = compute_bradley_terry(intra_pairwise)
+            agreement = compute_inter_judge_agreement(intra_pairwise)
             metrics["bt_rating"] = float(np.mean(list(bt.values()))) if bt else 0.0
             metrics["agreement"] = agreement["krippendorff_alpha"]
             metrics["reliable"] = 1.0 if agreement["num_judges"] >= 2 else 0.0
+            metrics["invalid_rate"] = agreement["invalid_rate"]
+            elo_values = list(elo.values())
+            if len(elo_values) >= 2:
+                std = float(np.std(elo_values))
+                metrics["intra_model_consistency"] = (
+                    float(np.mean(elo_values)) / std if std > 0 else 0.0
+                )
+            metadata["rating_scope"] = "intra_model"
+
+        if cross_pairwise and model_of_item:
+            model_ratings = compute_model_ratings(cross_pairwise, model_of_item)
+            metadata["model_ratings"] = model_ratings
+            metadata["rating_scope"] = "cross_model"
+            metadata["model_of_item"] = model_of_item
+            if raw.model in model_ratings["elo"]:
+                metrics["elo_rating"] = float(model_ratings["elo"][raw.model])
+            metrics["invalid_rate"] = float(model_ratings["invalid_rate"])
+
+        if pairwise or cross_pairwise:
+            all_pairwise = pairwise + [
+                r for r in cross_pairwise if r not in pairwise
+            ]
+            from cbf.judging.bias import (
+                length_controlled_ratings,
+                position_win_rate,
+                swap_consistency,
+            )
+
+            bias: dict = {
+                "position_win_rate": position_win_rate(all_pairwise),
+                "swap_consistency": swap_consistency(all_pairwise),
+            }
+            metrics["position_bias"] = abs(bias["position_win_rate"]["overall"] - 0.5)
+
+            if intra_pairwise:
+                elo = compute_elo(intra_pairwise)
+                lengths: dict[str, int] = {}
+                for item in raw.items:
+                    if "error" in item:
+                        continue
+                    lengths[_raw_item_id(item)] = len(item.get("text", ""))
+                if sum(1 for item_id in elo if item_id in lengths and lengths[item_id] > 0) >= 3:
+                    controlled = length_controlled_ratings(elo, lengths)
+                    bias["length_controlled_ratings"] = {
+                        item_id: float(value) for item_id, value in controlled.items()
+                    }
+            metadata["bias"] = bias
+
+        from cbf.judging.calibration import (
+            MIN_ITEMS,
+            MIN_JUDGES,
+            calibrated_panel_scores,
+        )
+
+        calibration_results = intra_pairwise or cross_pairwise
+        judges = {r.judge for r in calibration_results}
+        calibration_items = {
+            item_id
+            for r in calibration_results
+            for item_id in (r.item_a_id, r.item_b_id)
+        }
+        if len(judges) >= MIN_JUDGES and len(calibration_items) >= MIN_ITEMS:
+            try:
+                calibration = calibrated_panel_scores(calibration_results)
+                calibration["available"] = True
+            except Exception as exc:
+                calibration = {
+                    "available": False,
+                    "reason": f"calibration failed: {exc}",
+                }
+        else:
+            calibration = {
+                "available": False,
+                "reason": (
+                    f"requires >= {MIN_JUDGES} judges and >= {MIN_ITEMS} items "
+                    f"(have {len(judges)} judges and {len(calibration_items)} items)"
+                ),
+            }
+        metadata["calibration"] = calibration
 
         return Scores(
             benchmark_id=self.id,

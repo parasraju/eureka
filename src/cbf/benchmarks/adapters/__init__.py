@@ -16,6 +16,10 @@ class AdapterApprovalError(RuntimeError):
     """Raised when an adapter is used without human approval."""
 
 
+class AdapterNotRunnable(RuntimeError):
+    """Raised when a registry entry has no real prompts to run."""
+
+
 APPROVAL_STATUSES = {"approved"}
 
 
@@ -32,27 +36,22 @@ def require_approved(entry: RegistryEntry | RankedCandidate | dict, allow_status
 
 
 def build_prompts_from_entry(entry: RegistryEntry | dict, fallback: list[str] | None = None) -> list[str]:
-    """Recover runnable prompts from the discovered metadata (task format + summary)."""
+    """Return the entry's stored prompt list, or refuse to fabricate one."""
     data = entry.to_dict() if hasattr(entry, "to_dict") else dict(entry)
     metadata = data.get("metadata") or {}
     if isinstance(metadata, str):
         metadata = {}
-    extracted = metadata.get("extracted", {}) if isinstance(metadata, dict) else {}
     raw = metadata.get("raw", {}) if isinstance(metadata, dict) else {}
 
     prompts = raw.get("prompts") if isinstance(raw, dict) else None
     if isinstance(prompts, list) and prompts:
         return [str(p) for p in prompts]
 
-    task_format = extracted.get("task_format") or "evaluation benchmark"
-    name = data.get("title") or data.get("name") or "this benchmark"
-    summary = (data.get("summary") or "")[:500]
-    seed_prompt = (
-        f"You are being evaluated by '{name}' ({task_format}).\n"
-        f"Source description: {summary}\n\n"
-        f"Respond to the task described above as accurately and originally as you can."
+    entry_id = data.get("id", "?")
+    raise AdapterNotRunnable(
+        f"Registry entry {entry_id} has no runnable prompts; extract them from the "
+        f"source paper/repo and store them before running"
     )
-    return [seed_prompt] + list(fallback or [])
 
 
 class RegistryAdapter:
@@ -145,7 +144,11 @@ class RegistryAdapter:
             confidence_intervals={
                 "completion_rate": bootstrap_ci([1.0 if "error" not in i and i.get("text") else 0.0 for i in raw.items]),
             },
-            metadata={"adapter_of": self.entry.id, "requires_approval": True},
+            metadata={
+                "adapter_of": self.entry.id,
+                "requires_approval": True,
+                "proxy_metrics_only": True,
+            },
         )
 
 

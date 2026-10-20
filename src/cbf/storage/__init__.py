@@ -6,6 +6,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 
+class BudgetExceededError(RuntimeError):
+    """Raised when a run exceeds its configured spend cap."""
+
+
 @dataclass
 class CallLogEntry:
     run_id: str
@@ -20,6 +24,7 @@ class CallLogEntry:
     input_tokens: int = 0
     output_tokens: int = 0
     error: str | None = None
+    cost_basis: str | None = None
 
 
 @dataclass
@@ -33,11 +38,12 @@ class RunManifest:
     prompt_set_hashes: dict[str, str] = field(default_factory=dict)
     embedding_model: str = ""
     judge_models: list[str] = field(default_factory=list)
-    conditions: dict = field(default_factory=dict)
+    conditions: list[str] = field(default_factory=list)
     total_cost_usd: float = 0.0
     total_calls: int = 0
     status: str = "running"
     suite: str = ""
+    result_file: str = "results.jsonl"
     error: str | None = None
 
 
@@ -61,6 +67,11 @@ class BudgetGuard:
     def remaining(self) -> float:
         with self._lock:
             return max(0.0, self.max_usd - self.spent_usd)
+
+    def add_spend(self, cost: float) -> None:
+        """Record spend that already exceeded the cap (cost accounting must stay truthful)."""
+        with self._lock:
+            self.spent_usd += cost
 
 
 class CallLogger:
@@ -88,6 +99,7 @@ class CallLogger:
         error: str | None = None,
         input_tokens: int = 0,
         output_tokens: int = 0,
+        cost_basis: str | None = None,
     ) -> str:
         call_id = str(uuid.uuid4())
         entry = CallLogEntry(
@@ -103,6 +115,7 @@ class CallLogger:
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             error=error,
+            cost_basis=cost_basis,
         )
 
         with self._lock:

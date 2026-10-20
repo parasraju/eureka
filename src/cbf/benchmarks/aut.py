@@ -5,8 +5,9 @@ from dataclasses import dataclass, field
 import numpy as np
 from sklearn.metrics.pairwise import cosine_distances
 
+from cbf import metrics as cbf_metrics
+
 from .base import BenchmarkItem, RawResults, Scores
-from .dat import DATBenchmark, DATConfig
 
 
 @dataclass
@@ -19,6 +20,8 @@ class AUTConfig:
     ])
     embedding_model: str = "glove"
     glove_path: str | None = None
+    st_model: str = "sentence-transformers/all-MiniLM-L6-v2"
+    flexibility_threshold: float = 0.75
 
 
 class AUTBenchmark:
@@ -48,7 +51,6 @@ Only list the uses, one per line."""
 
     def __init__(self, config: AUTConfig | None = None):
         self.config = config or AUTConfig()
-        self._dat = DATBenchmark(DATConfig(embedding_model=self.config.embedding_model, glove_path=self.config.glove_path))
 
     def prompts(self) -> list[BenchmarkItem]:
         items = []
@@ -136,32 +138,63 @@ Only list the uses, one per line."""
         return uses[:self.config.num_uses]
 
     def _get_use_vectors(self, uses: list[str]) -> np.ndarray:
-        return self._dat._get_word_vectors(uses)
+        """Embed uses as full phrases; word-level GloVe cannot represent phrases."""
+        try:
+            vectors = cbf_metrics.embed_texts(uses, self.config.st_model)
+        except Exception as exc:
+            raise RuntimeError(
+                f"AUT embeddings failed (model={self.config.st_model!r}): {exc}"
+            ) from exc
+        return np.asarray(vectors, dtype=float)
 
-    def _compute_flexibility(self, uses: list[str], object_name: str) -> int:
-        common = self.COMMON_USES.get(object_name, [])
-        common_vecs = self._get_use_vectors(common) if common else np.array([])
+    def _compute_flexibility(self, uses: list[str], object_name: str | None = None) -> int:
+        if not uses:
+            return 0
         use_vecs = self._get_use_vectors(uses)
+        if len(use_vecs) == 0:
+            return 0
+        return len(cbf_metrics.cluster_by_similarity(use_vecs, self.config.flexibility_threshold))
 
+    def _compute_originality(self, uses: list[str], object_name: str) -> float:
+        common = self.COMMON_USES.get(object_name, [])
+        if not uses or not common:
+            return 0.0
+
+        common_vecs = self._get_use_vectors(common)
+        use_vecs = self._get_use_vectors(uses)
         if len(common_vecs) == 0 or len(use_vecs) == 0:
-            return len(set(uses))
+            return 0.0
 
-        distances = cosine_distances(use_vecs, common_vecs)
-        min_dists = np.min(distances, axis=1)
-        novel = np.sum(min_dists > 0.7)
-        return int(novel) + len(set(uses)) // 2
+        centroid = np.mean(common_vecs, axis=0, keepdims=True)
+        distances = cosine_distances(use_vecs, centroid).ravel()
+        lo = float(np.min(distances))
+        hi = float(np.max(distances))
+        if hi - lo <= 1e-12:
+            return 0.0
+        scaled = (distances - lo) / (hi - lo) * 100.0
+        return float(np.mean(np.clip(scaled, 0.0, None)))
 
     def score(self, raw: RawResults) -> Scores:
-        valid_items = [item for item in raw.items if item.get("valid", False)]
-        if not valid_items:
+        scored_items = [item for item in raw.items if "error" not in item]
+        valid_items = [item for item in scored_items if item.get("valid", False)]
+        if not scored_items:
             return Scores(
                 benchmark_id=self.id,
                 model=raw.model,
-                metrics={"fluency": 0.0, "flexibility": 0.0, "originality": 0.0, "valid_samples": 0},
+                metrics={
+                    "fluency": 0.0,
+                    "flexibility": 0.0,
+                    "originality": 0.0,
+                    "elaboration": 0.0,
+                    "valid_samples": 0,
+                    "total_samples": len(raw.items),
+                    "compliance_rate": 0.0,
+                    "error_samples": len(raw.items),
+                },
             )
 
         by_object: dict[str, list[dict]] = {}
-        for item in valid_items:
+        for item in scored_items:
             obj = item.get("object", "unknown")
             if obj not in by_object:
                 by_object[obj] = []
@@ -170,32 +203,28 @@ Only list the uses, one per line."""
         all_fluency = []
         all_flexibility = []
         all_originality = []
+        elaboration_per_sample = []
 
         for obj, items in by_object.items():
             for item in items:
                 uses = item.get("uses", [])
-                if not uses:
+                if not item.get("valid", False) or not uses:
+                    # Non-compliant samples score zero rather than disappearing.
+                    all_fluency.append(0.0)
+                    all_flexibility.append(0.0)
+                    all_originality.append(0.0)
+                    elaboration_per_sample.append(0.0)
                     continue
 
-                fluency = len(uses)
-                all_fluency.append(fluency)
+                all_fluency.append(len(uses))
+                all_flexibility.append(self._compute_flexibility(uses, obj))
+                all_originality.append(self._compute_originality(uses, obj))
+                elaboration_per_sample.append(float(np.mean([len(u.split()) for u in uses])))
 
-                flexibility = self._compute_flexibility(uses, obj)
-                all_flexibility.append(flexibility)
+        elaboration = float(np.mean(elaboration_per_sample)) if elaboration_per_sample else 0.0
+        compliance_rate = len(valid_items) / len(scored_items) if scored_items else 0.0
 
-                use_vecs = self._get_use_vectors(uses)
-                if len(use_vecs) > 1:
-                    distances = cosine_distances(use_vecs)
-                    np.fill_diagonal(distances, np.nan)
-                    originality = float(np.nanmean(distances)) * 100
-                else:
-                    originality = 0.0
-                all_originality.append(originality)
-
-        from cbf.metrics import mean_ci
-
-        def ci(data):
-            return mean_ci(data)
+        ci = cbf_metrics.mean_ci
 
         return Scores(
             benchmark_id=self.id,
@@ -204,14 +233,17 @@ Only list the uses, one per line."""
                 "fluency": float(np.mean(all_fluency)) if all_fluency else 0.0,
                 "flexibility": float(np.mean(all_flexibility)) if all_flexibility else 0.0,
                 "originality": float(np.mean(all_originality)) if all_originality else 0.0,
-                "elaboration": float(np.mean([len(u) for item in valid_items for u in item.get("uses", [])])) if valid_items else 0.0,
+                "elaboration": elaboration,
                 "valid_samples": len(valid_items),
                 "total_samples": len(raw.items),
+                "compliance_rate": compliance_rate,
+                "error_samples": len(raw.items) - len(scored_items),
             },
             confidence_intervals={
                 "fluency": ci(all_fluency),
                 "flexibility": ci(all_flexibility),
                 "originality": ci(all_originality),
+                "elaboration": ci(elaboration_per_sample),
             },
             metadata={
                 "condition": raw.metadata.get("condition", "unknown"),

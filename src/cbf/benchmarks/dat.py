@@ -8,6 +8,40 @@ from sklearn.metrics.pairwise import cosine_distances
 
 from .base import BenchmarkItem, RawResults, Scores
 
+_GLOVE_CACHE: dict[str, dict[str, np.ndarray]] = {}
+
+
+def _get_glove_vectors(config: "DATConfig") -> dict[str, np.ndarray]:
+    """Cache GloVe vectors per config (by glove path or default cache dir)."""
+    cache_key = config.glove_path or "default"
+    if cache_key in _GLOVE_CACHE:
+        return _GLOVE_CACHE[cache_key]
+
+    if config.glove_path:
+        path = Path(config.glove_path)
+    else:
+        cache_dir = Path.home() / ".cache" / "cbf" / "glove"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        path = cache_dir / "glove.6B.300d.txt"
+
+    if not path.exists():
+        raise FileNotFoundError(
+            f"GloVe vectors not found at {path}. Download from https://nlp.stanford.edu/projects/glove/ "
+            f"or set DATConfig.glove_path"
+        )
+
+    vectors: dict[str, np.ndarray] = {}
+    dim = 300
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            parts = line.strip().split()
+            if len(parts) == dim + 1:
+                word = parts[0]
+                vectors[word] = np.array([float(x) for x in parts[1:]], dtype=np.float32)
+
+    _GLOVE_CACHE[cache_key] = vectors
+    return vectors
+
 
 @dataclass
 class DATConfig:
@@ -38,8 +72,6 @@ Example format: word1, word2, word3, word4, word5, word6, word7, word8, word9, w
 
     def __init__(self, config: DATConfig | None = None):
         self.config = config or DATConfig()
-        self._glove_vectors: dict[str, np.ndarray] | None = None
-        self._glove_dim: int = 300
 
     def prompts(self) -> list[BenchmarkItem]:
         return [
@@ -94,12 +126,11 @@ Example format: word1, word2, word3, word4, word5, word6, word7, word8, word9, w
 
         for r in results:
             if isinstance(r, Exception):
-                items.append({"sample_idx": -1, "error": str(r), "words": []})
-            else:
-                words = self._parse_words(r["response"])
-                r["words"] = words
-                r["valid"] = len(words) == self.config.num_words
-                items.append(r)
+                raise r
+            words = self._parse_words(r["response"])
+            r["words"] = words
+            r["valid"] = len(words) == self.config.num_words
+            items.append(r)
 
         return RawResults(
             benchmark_id=self.id,
@@ -120,96 +151,51 @@ Example format: word1, word2, word3, word4, word5, word6, word7, word8, word9, w
                 cleaned.append(w)
         return cleaned[:self.config.num_words]
 
-    _glove_cache: dict[str, dict[str, np.ndarray]] = {}
-
-
-def _get_glove_vectors(config: DATConfig) -> dict[str, np.ndarray]:
-    """Cache GloVe vectors per config (by glove path or default cache dir)."""
-    cache_key = config.glove_path or "default"
-    if cache_key in _glove_cache:
-        return _glove_cache[cache_key]
-
-    from pathlib import Path
-    import numpy as np
-
-    if config.glove_path:
-        path = Path(config.glove_path)
-    else:
-        cache_dir = Path.home() / ".cache" / "cbf" / "glove"
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        path = cache_dir / "glove.6B.300d.txt"
-
-    if not path.exists():
-        raise FileNotFoundError(
-            f"GloVe vectors not found at {path}. Download from https://nlp.stanford.edu/projects/glove/ "
-            f"or set DATConfig.glove_path"
-        )
-
-    vectors = {}
-    _dim = 300
-    with open(path, encoding="utf-8") as f:
-        for line in f:
-            parts = line.strip().split()
-            if len(parts) == _dim + 1:
-                word = parts[0]
-                vec = np.array([float(x) for x in parts[1:]], dtype=np.float32)
-                vectors[word] = vec
-
-    _glove_cache[cache_key] = vectors
-    return vectors
-
     def _get_word_vectors(self, words: list[str]) -> np.ndarray:
         if self.config.embedding_model == "glove":
             glove = _get_glove_vectors(self.config)
-            vecs = []
-            for w in words:
-                if w in glove:
-                    vecs.append(glove[w])
-                else:
-                    vecs.append(np.zeros(self._glove_dim, dtype=np.float32))
-            return np.array(vecs)
-        else:
-            raise NotImplementedError(f"Embedding model {self.config.embedding_model} not implemented")
+            return np.array([glove[w] for w in words if w in glove], dtype=np.float32)
+        raise NotImplementedError(f"Embedding model {self.config.embedding_model} not implemented")
 
     def score(self, raw: RawResults) -> Scores:
-        valid_items = [item for item in raw.items if item.get("valid", False)]
-        if not valid_items:
-            return Scores(
-                benchmark_id=self.id,
-                model=raw.model,
-                metrics={"dat_score": 0.0, "valid_samples": 0},
-                metadata={"error": "No valid samples"},
-            )
-
-        all_scores = []
-        for item in valid_items:
-            words = item.get("words", [])
-            if len(words) < 2:
-                continue
-            vecs = self._get_word_vectors(words)
-            if len(vecs) < 2:
-                continue
-            distances = cosine_distances(vecs)
-            np.fill_diagonal(distances, np.nan)
-            mean_dist = np.nanmean(distances)
-            dat_score = mean_dist * 100
-            all_scores.append(dat_score)
-
-        if not all_scores:
-            return Scores(
-                benchmark_id=self.id,
-                model=raw.model,
-                metrics={"dat_score": 0.0, "valid_samples": 0},
-            )
-
-        all_scores = np.array(all_scores)
-        mean_score = float(np.mean(all_scores))
-        std_score = float(np.std(all_scores, ddof=1)) if len(all_scores) > 1 else 0.0
-        n = len(all_scores)
-
         from cbf.metrics import mean_ci
 
-        ci_low, ci_high = mean_ci(all_scores.tolist())
+        all_scores: list[float] = []
+        valid_samples = 0
+        oov_terms = 0
+
+        for item in raw.items:
+            if not item.get("valid", False):
+                all_scores.append(0.0)
+                continue
+
+            words = item.get("words", [])
+            if len(words) < 2:
+                all_scores.append(0.0)
+                continue
+
+            vecs = self._get_word_vectors(words)
+            oov_terms += max(0, len(words) - len(vecs))
+            if len(vecs) < 2:
+                all_scores.append(0.0)
+                continue
+
+            distances = cosine_distances(vecs)
+            np.fill_diagonal(distances, np.nan)
+            mean_dist = float(np.nanmean(distances))
+            if np.isnan(mean_dist):
+                all_scores.append(0.0)
+                continue
+
+            all_scores.append(mean_dist * 100)
+            valid_samples += 1
+
+        total_samples = len(raw.items)
+        scores = np.asarray(all_scores, dtype=float)
+        mean_score = float(np.mean(scores)) if scores.size else 0.0
+        std_score = float(np.std(scores, ddof=1)) if scores.size > 1 else 0.0
+        compliance_rate = (valid_samples / total_samples) if total_samples else 0.0
+        ci_low, ci_high = mean_ci(scores.tolist())
 
         return Scores(
             benchmark_id=self.id,
@@ -217,13 +203,15 @@ def _get_glove_vectors(config: DATConfig) -> dict[str, np.ndarray]:
             metrics={
                 "dat_score": mean_score,
                 "dat_score_std": std_score,
-                "valid_samples": n,
-                "total_samples": len(raw.items),
+                "valid_samples": valid_samples,
+                "total_samples": total_samples,
+                "compliance_rate": compliance_rate,
+                "oov_terms": oov_terms,
             },
             confidence_intervals={"dat_score": (float(ci_low), float(ci_high))},
             metadata={
                 "condition": raw.metadata.get("condition", "unknown"),
-                "individual_scores": all_scores.tolist(),
+                "individual_scores": scores.tolist(),
             },
         )
 

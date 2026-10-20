@@ -77,6 +77,8 @@ def length_controlled_ratings(ratings: dict[str, float], lengths: dict[str, int]
 
     x = np.log(np.array([lengths[i] for i in ids], dtype=float))
     y = np.array([ratings[i] for i in ids], dtype=float)
+    if float(np.max(x) - np.min(x)) == 0.0:
+        return dict(ratings)
     slope, intercept = np.polyfit(x, y, 1)
     controlled = {i: float(ratings[i] - slope * np.log(lengths[i])) for i in ids}
     grand = float(np.mean(list(controlled.values())))
